@@ -1,0 +1,17 @@
+[project]
+name = "rag-b1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "jiahua", email = "jiahuazh_07@outlook.com" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+rag-b1 = "rag_b1:main"
+
+[build-system]
+requires = ["uv_build>=0.12.16,<0.13.0"]
+build-backend = "uv_build"
