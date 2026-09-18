@@ -1,17 +1,17 @@
 [project]
 name = "rag-b1"
 version = "0.1.0"
-description = "Add your description here"
+description = "Warhammer 40K RAG chatbot using a rulebook PDF and SQLite unit data"
 readme = "README.md"
 authors = [
-    { name = "jiahua", email = "jiahuazh_07@outlook.com" }
+    { name = "jiahua", email = "jiahuazh_07@outlook.com" },
+    { name = "PengCHEN", email = "sslchenpeng@gmail.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "docling>=2.129.0",
+    "langchain-core>=1.6.3",
+]
 
-[project.scripts]
-rag-b1 = "rag_b1:main"
-
-[build-system]
-requires = ["uv_build>=0.12.16,<0.13.0"]
-build-backend = "uv_build"
+[tool.uv]
+package = false
