@@ -14,8 +14,8 @@ if __package__ in (None, ""):
 from google import genai
 from google.genai import types
 
-from sql_retriver.fixed_func import sql_retrieve_fixed_funcs, make_sql_query, parse_function_call, response_schema
-from sql_retriver.functions import get_unit_all_metadata
+from sql_retriever.fixed_func import sql_retrieve_fixed_funcs, make_sql_query, parse_function_call, response_schema
+from sql_retriever.functions import get_unit_all_metadata
 
 
 class FixedFunctionTests(unittest.TestCase):
@@ -76,7 +76,7 @@ class FixedFunctionTests(unittest.TestCase):
             con.commit()
         finally:
             con.close()
-        db_patch = patch("sql_retriver.fixed_func.DB_PATH", db_path)
+        db_patch = patch("sql_retriever.fixed_func.DB_PATH", db_path)
         db_patch.start()
         self.addCleanup(db_patch.stop)
 
@@ -161,7 +161,7 @@ class FixedFunctionTests(unittest.TestCase):
         client.models.generate_content.return_value = SimpleNamespace(
             text='{"name": null, "arguments": {}}'
         )
-        with patch("sql_retriver.fixed_func.make_sql_query") as execute:
+        with patch("sql_retriever.fixed_func.make_sql_query") as execute:
             self.assertIsNone(sql_retrieve_fixed_funcs("Get metadata for Warboss", client=client))
             execute.assert_not_called()
 
