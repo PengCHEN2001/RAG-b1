@@ -7,8 +7,9 @@ from contextlib import closing
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from functions import FUNCTION_REGISTRY, get_function_declarations
+    from sql_retriver.functions import FUNCTION_REGISTRY, get_function_declarations
+else:
+    from .functions import FUNCTION_REGISTRY, get_function_declarations
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "sql" / "wahadb.sqlite"
 
