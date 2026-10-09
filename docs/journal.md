@@ -15,6 +15,27 @@
 - All tests passed successfully.
 - Run with `uv run python -m unittest discover -s tests -v`.
 
+## 2026-10-09 — Rulebook Chunking and Local Indexes
+
+### `ingestion/chunker.py`
+
+- Added document-aware recursive chunking from the Docling JSON. The chunker resolves `$ref` values in `body.children`, tracks the heading hierarchy, preserves lists and tables, links pictures through the manifest, and filters page furniture.
+- Added BGE-tokenizer length checks with a 450-token maximum. Long logical units split at sentence boundaries with a 60-token overlap; related parts share a `logical_unit_id` and retain page and element provenance.
+- Generated `data/processed/Core Rules.chunks.jsonl` from the 60-page rulebook: 212 chunks, all with unique IDs and a maximum length of 446 tokens.
+- Run with `uv run python -m ingestion.chunker "data/processed/Core Rules.json"`.
+
+### `ingestion/build_index.py`
+
+- Added local `BAAI/bge-base-en-v1.5` embedding generation with content-hash caching. Each chunk is stored as a normalised 768-dimensional vector, with its text and filterable metadata, in a persistent Chroma collection.
+- Added a parallel `rank_bm25` keyword index using the same chunk order and text. BM25 is saved beside the Chroma database with an aligned `chunk_id` list and an index manifest.
+- Built and verified both indexes in `data/indexes/core_rules/`: Chroma contains 212 vectors and BM25 contains 212 chunk IDs. A Wound Roll keyword check returned the corresponding rule chunk.
+- Run with `uv run python -m ingestion.build_index "data/processed/Core Rules.chunks.jsonl" --recreate`.
+
+### `tests/test_chunker.py`
+
+- Added basic tests for heading context, list and image metadata, and splitting a long logical unit into correctly linked parts.
+- All tests passed successfully.
+
 ## 2026-10-02 — Fixed-Function SQLite Retriever
 
 ### `sql_retriver/functions.py`
