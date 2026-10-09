@@ -136,7 +136,11 @@ def write_chroma(
             pass
     collection = client.get_or_create_collection(
         name=collection_name,
-        metadata={"embedding_model": model_name, "embedding_dimension": dimension},
+        metadata={
+            "hnsw:space": "cosine",
+            "embedding_model": model_name,
+            "embedding_dimension": dimension,
+        },
         embedding_function=None,
     )
     batch_size = 100
@@ -182,6 +186,7 @@ def write_manifest(
         "embedding_model": model_name,
         "embedding_dimension": dimension,
         "chroma_collection": collection_name,
+        "vector_distance_space": "cosine",
         "bm25_tokenizer_version": "regex-v1",
     }
     (output_dir / "index_manifest.json").write_text(

@@ -36,6 +36,17 @@
 - Added basic tests for heading context, list and image metadata, and splitting a long logical unit into correctly linked parts.
 - All tests passed successfully.
 
+### `retrieval/rulebook_retriever.py`
+
+- Added a RulebookRetriever that accepts Router-produced original, semantic, and keyword queries. It runs BGE dense retrieval through Chroma's persistent HNSW cosine index, original-query BM25, and keyword-query BM25 before applying Reciprocal Rank Fusion.
+- Added local lazy loading of `cross-encoder/ms-marco-MiniLM-L6-v2` to rerank the fused candidates and return the final five source chunks with provenance, route ranks, RRF score, and reranker score. This lightweight English model suits the current English rulebook and local hardware; `Qwen/Qwen3-Reranker-0.6B` remains a future option for stronger or multilingual reranking. The Retriever does not generate an answer.
+- Verified a real Wound Roll query: the top result was the `2. WOUND ROLL` section on PDF pages 21–22.
+- Run with `uv run python -m retrieval.rulebook_retriever "How does a wound roll work?"`.
+
+### `tests/test_rulebook_retriever.py`
+
+- Added tests for Router-query fallbacks, RRF fusion and deduplication, reranking, and returned source metadata. Tests use local fakes and do not download models.
+
 ## 2026-10-02 — Fixed-Function SQLite Retriever
 
 ### `sql_retriver/functions.py`
