@@ -217,8 +217,12 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Generated PDF conversion outputs
-data/processed/
+# Generated parser outputs: keep only the shared chunk file.
+data/processed/*
+!data/processed/Core Rules.chunks.jsonl
+
+# Local, rebuildable vector and BM25 indexes.
+data/indexes/
 
 
 .python-version
