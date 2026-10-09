@@ -10,7 +10,9 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "docling>=2.129.0",
+    "google-genai>=2.24.0",
     "langchain-core>=1.6.3",
+    "python-dotenv>=1.2.3",
 ]
 
 [tool.uv]
