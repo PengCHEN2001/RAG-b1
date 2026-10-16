@@ -215,6 +215,88 @@ Final top 5 source chunks
 
 The current reranker is `cross-encoder/ms-marco-MiniLM-L6-v2`. It is a small English cross-encoder, suitable for reranking only 12 candidates from the English rulebook on a local student laptop. If future evaluation requires stronger semantic ranking or multilingual query support, it can be replaced with, like the larger `Qwen/Qwen3-Reranker-0.6B`; that model requires substantially more local storage and memory.
 
+## SQL Retriever Design
+
+The main entry point is `retrieve_sql(question: str)` in `sql_retriever/hybrid.py`, also exported as `sql_retriever.retrieve_sql`. It prefers registered parameterized functions when one function can answer the whole question and uses LLM-generated SQL for requests outside their coverage.
+
+```text
+question: str
+  -> Validate input, load the full data dictionary, and prepare the model client
+  -> LLM routing: return a structured intent
+  -> Validate the JSON, entity declarations, and routing configuration
+       |
+       +-- unsupported
+       |     -> Return RetrievalResult(status="unsupported")
+       |
+       +-- fixed / generated
+             -> For fixed requests, normalize literal IDs into entity references
+             -> resolve_entities(): exact database lookup
+                  |
+                  +-- No match, multiple matches, or truncated candidates
+                  |     -> Return needs_clarification with candidates
+                  |
+                  +-- Unique matches, or no entities to resolve
+                        -> resolved entity dictionary
+                             |
+                             +-- fixed
+                             |     -> Validate and substitute entity references
+                             |     -> Registered builder returns SQL + parameters
+                             |
+                             +-- generated
+                                   -> LLM receives the question, resolved entities,
+                                      generation rules, and full data dictionary
+                                   -> Return SQL + parameters, or stop with
+                                      needs_clarification / unsupported
+                                   -> Check parameters and resolved-ID bindings
+
+Executable SQL + parameters
+  -> execute_bounded(): authorized, resource-bounded, read-only execution
+  -> Assemble and return RetrievalResult
+```
+
+The routing intent contains `mode`, `function`, `arguments`, `entities`, and `message`. For example:
+
+```json
+{
+  "mode": "fixed",
+  "function": "get_unit_abilities",
+  "arguments": {"d_id": "@unit"},
+  "entities": [
+    {"key": "unit", "kind": "unit", "match": "name", "value": "Warboss"}
+  ],
+  "message": ""
+}
+```
+
+An entity declaration describes an object to look up. Its `key` is a request-local reference name, `kind` selects a lookup definition from `ENTITY_TABLES`, `match` is the string `"name"` or `"id"`, and `value` must appear in the original question. The model extracts these lookup descriptions; the application obtains the actual IDs from SQLite.
+
+`validate_entities()` checks the declarations and their occurrence in the question. On the fixed path, `_normalize_fixed_references()` converts literal `d_id` or `faction_id` arguments into `@entity_key` references, adding ID-based entity declarations where necessary. This sends explicitly supplied IDs through the same database verification as names.
+
+`resolve_entities()` in `sql_retriever/entities.py` resolves factions first and uses a single resolved faction to narrow other lookups where a faction column exists. Names use trimmed, case-insensitive exact matching; IDs use exact string matching and retain leading zeros. When every lookup has a unique candidate, it returns a dictionary indexed by entity key:
+
+```json
+{
+  "unit": {
+    "key": "unit",
+    "kind": "unit",
+    "id": "000000001",
+    "name": "Warboss",
+    "faction_id": "ORK"
+  }
+}
+```
+
+Uniqueness is determined under the lookup table and applicable filters; an ID is not assumed to be globally unique. Missing or ambiguous matches, including truncated candidate lookups, return `RetrievalResult(status="needs_clarification")` and stop retrieval. An empty entity list produces an empty resolved dictionary and requires no lookup queries.
+
+On the fixed path, `_fixed_query()` checks reference types, substitutes verified IDs, and validates the selected function's required and allowed arguments before calling its builder. A role filter must be explicitly supplied in the question. On the generated path, the second model call returns `mode`, `sql`, `parameters`, and `message`; only `mode="query"` proceeds to execution. The application checks that each resolved entity retains its exact `<entity_key>_id` parameter binding.
+
+Both model stages receive the complete unchanged `data/sql/SQL_AGENT_DATA_DICTIONARY.md`. Generation rules take precedence over its examples and add semantic guidance, including card-specific ability overrides, distinct counts, cost configurations, and a guarded TEXT-to-integer template. These semantic rules guide the model; there is no separate live-schema or AST validation module.
+
+Fixed queries, generated queries, and entity lookups all use `execute_bounded()` in `sql_retriever/safety.py`. It validates input boundaries, opens a read-only connection, applies business-table and function authorization, executes one statement, and enforces execution and result budgets. It returns `columns`, `rows`, and `truncated`. The outer retriever adds the executed SQL, parameters, strategy, and status: non-empty or truncated results are `ok`; an empty, untruncated result is `empty`. Expected validation, model, and execution failures become `error` results with an `error_code`. Natural-language answer generation belongs to the downstream answer layer.
+
+Only a generated query's syntax or name-resolution failure permits one model repair with bounded compilation diagnostics. Empty results, permission denials, parameter errors, and execution-budget failures do not retry. A failed fixed request does not automatically switch to generation. Fixed requests normally use one model call; generated requests use two, or three when a repair is attempted.
+
+
 ## Build and Simple Verification
 
 ```bash

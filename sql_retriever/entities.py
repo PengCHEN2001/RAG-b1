@@ -5,7 +5,6 @@ from pathlib import Path
 
 from .result import RetrievalFailure, RetrievalResult
 from .safety import execute_bounded
-from .schema import SchemaContext
 
 ENTITY_TABLES = {
     "unit": ("datasheets", "Id", "factionId"),
@@ -40,14 +39,11 @@ def validate_entities(entities: object, question: str) -> list[dict[str, str]]:
     return entities
 
 
-def resolve_entities(entities: list[dict[str, str]], path: Path,
-                     schema: SchemaContext) -> dict[str, dict[str, str]] | RetrievalResult:
+def resolve_entities(entities: list[dict[str, str]], path: Path) -> dict[str, dict[str, str]] | RetrievalResult:
     resolved = {}
     ordered = sorted(entities, key=lambda e: e["kind"] != "faction")
     for entity in ordered:
         table, id_column, faction_column = ENTITY_TABLES[entity["kind"]]
-        if table not in schema.tables:
-            return RetrievalResult("unsupported", message="Entity table is absent from this database.")
         predicate = (f'"{id_column}" = :value' if entity["match"] == "id" else
                      '"name" = :value COLLATE NOCASE')
         fields = f'"{id_column}", "name"'
@@ -59,7 +55,7 @@ def resolve_entities(entities: list[dict[str, str]], path: Path,
             predicate += f' AND "{faction_column}" = :faction'
             args["faction"] = factions[0]
         query = execute_bounded(path, f'SELECT DISTINCT {fields} FROM "{table}" '
-                                f'WHERE {predicate} ORDER BY "{id_column}"', args, schema)
+                                f'WHERE {predicate} ORDER BY "{id_column}"', args)
         candidates = [{"key": entity["key"], "kind": entity["kind"],
                        "id": row[0], "name": row[1],
                        **({"faction_id": row[2]} if faction_column else {})}

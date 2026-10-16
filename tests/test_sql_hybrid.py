@@ -10,11 +10,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sql_retriever import retrieve_sql
+from sql_retriever.hybrid import DATA_DICTIONARY_PATH, INTEGER_TEMPLATE
 from sql_retriever.result import PolicyViolation, RetrievalFailure
 from sql_retriever.safety import (
-    ExecutedQuery, ExecutionLimits, execute_bounded, install_authorizer, validate_sql,
+    ExecutionLimits, execute_bounded, install_authorizer, open_readonly,
 )
-from sql_retriever.schema import inspect_schema, integer_expression, open_readonly
 
 
 def entity(key="unit", kind="unit", value="Warboss", match="name"):
@@ -65,11 +65,10 @@ class HybridRetrievalTests(unittest.TestCase):
                     ('000000001', 'Signed', '-2'), ('000000002', 'Save', '2+');
             ''')
             connection.commit()
-        self.schema = inspect_schema(self.path)
 
     def retrieve(self, question, *responses):
         client = client_for(*responses)
-        return retrieve_sql(question, client=client, db_path=self.path), client
+        return retrieve_sql(question, client=client, db_path=self.path, timing=False), client
 
     def test_fixed_route_resolves_names_ids_and_faction_context(self):
         cases = [
@@ -96,9 +95,10 @@ class HybridRetrievalTests(unittest.TestCase):
                 self.assertEqual(client.models.generate_content.call_count, 1)
 
     def test_generated_route_executes_grounded_numeric_query(self):
+        numeric_toughness = INTEGER_TEMPLATE.format(column="m.t")
         sql = f'''SELECT d.Id, d.name FROM datasheets d
             INNER JOIN datasheets_models m ON m.DatasheetId=d.Id
-            WHERE d.factionId=:faction_id AND {integer_expression("m.t")}>=:minimum
+            WHERE d.factionId=:faction_id AND {numeric_toughness}>=:minimum
             AND EXISTS (SELECT k.DatasheetId FROM datasheets_keywords k
                         WHERE k.DatasheetId=d.Id AND k.keyword=:keyword)'''
         result, client = self.retrieve("Orks INFANTRY with toughness at least 10", intent(
@@ -107,6 +107,19 @@ class HybridRetrievalTests(unittest.TestCase):
         self.assertEqual((result.status, result.strategy), ("ok", "generated"), result)
         self.assertEqual(result.rows, [("000000001", "Warboss")])
         self.assertEqual(client.models.generate_content.call_count, 2)
+
+    def test_full_dictionary_is_in_both_prompts_and_sql_executes_once(self):
+        sql = "SELECT name FROM datasheets ORDER BY Id LIMIT 2"
+        with patch("sql_retriever.hybrid.execute_bounded", wraps=execute_bounded) as execute:
+            result, client = self.retrieve("List two unit names", intent(), query(sql))
+        self.assertEqual(result.rows, [("Warboss",), ("Boyz",)])
+        self.assertEqual(result.sql, sql)
+        execute.assert_called_once_with(self.path, sql, {})
+        dictionary = DATA_DICTIONARY_PATH.read_text(encoding="utf-8")
+        for call in client.models.generate_content.call_args_list:
+            prompt = call.kwargs["config"]["system_instruction"]
+            reference = prompt.split("<data_dictionary>\n", 1)[1].rsplit("\n</data_dictionary>", 1)[0]
+            self.assertEqual(reference, dictionary)
 
     def test_compilation_repair_is_limited_to_one_attempt(self):
         invalid = query("SELECT imaginary FROM datasheets")
@@ -117,11 +130,17 @@ class HybridRetrievalTests(unittest.TestCase):
                 self.assertEqual(client.models.generate_content.call_count, 3)
                 if expected == "error":
                     self.assertEqual(result.error_code, "sql_compilation")
+                repair = json.loads(client.models.generate_content.call_args.kwargs["contents"])["repair"]
+                self.assertIn("imaginary", repair["message"])
+                self.assertEqual(repair["error_code"], "sql_compilation")
 
     def test_empty_policy_and_budget_failures_do_not_retry(self):
         cases = [
             (query("SELECT Id FROM datasheets WHERE name=:name", {"name": "Nobody"}), "empty", None),
             (query("DELETE FROM datasheets"), "error", "sql_policy"),
+            (query("SELECT Id FROM datasheets WHERE name=:name"), "error", "sql_policy"),
+            (query("SELECT Id FROM datasheets; SELECT Id FROM datasheets"), "error", "sql_policy"),
+            (query("SELECT value FROM private_notes"), "error", "sql_policy"),
         ]
         for response, status, code in cases:
             with self.subTest(status=status):
@@ -129,8 +148,8 @@ class HybridRetrievalTests(unittest.TestCase):
                 self.assertEqual((result.status, result.error_code), (status, code))
                 self.assertEqual(client.models.generate_content.call_count, 2)
         client = client_for(intent(), query("SELECT Id FROM datasheets"))
-        with patch("sql_retriever.hybrid.execute_bounded", side_effect=[
-                ExecutedQuery([], [], False), RetrievalFailure("query_budget", "Budget exceeded.")]):
+        with patch("sql_retriever.hybrid.execute_bounded",
+                   side_effect=RetrievalFailure("query_budget", "Budget exceeded.")):
             result = retrieve_sql("List units", client=client, db_path=self.path)
         self.assertEqual(result.error_code, "query_budget")
         self.assertEqual(client.models.generate_content.call_count, 2)
@@ -151,7 +170,7 @@ class HybridRetrievalTests(unittest.TestCase):
                 self.assertEqual(client.models.generate_content.call_count, 1)
         client = Mock()
         client.models.generate_content.side_effect = RuntimeError("private provider details")
-        result = retrieve_sql("Get units", client=client, db_path=self.path)
+        result = retrieve_sql("Get units", client=client, db_path=self.path, timing=False)
         self.assertEqual(result.error_code, "model_error")
         self.assertNotIn("private", result.message)
 
@@ -163,40 +182,102 @@ class HybridRetrievalTests(unittest.TestCase):
         with closing(open_readonly(self.path)) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM datasheets").fetchone(), (4,))
         with self.assertRaises(PolicyViolation):
-            validate_sql("SELECT Id FROM datasheets WHERE Id=:id", {}, self.schema)
+            execute_bounded(self.path, "SELECT Id FROM datasheets WHERE Id=:id", {})
         result, _ = self.retrieve("Warboss model stats", intent(entities=[entity()]), query(
             "SELECT name FROM datasheets_models WHERE DatasheetId=:unit_id", {"unit_id": "000000002"}))
         self.assertEqual(result.error_code, "sql_policy")
 
-    def test_sql_validation_and_runtime_authorizer_reject_unsafe_access(self):
+    def test_runtime_authorizer_rejects_unsafe_access(self):
         unsafe = [
             ("DELETE FROM datasheets", {}),
+            ("UPDATE datasheets SET name=:name", {"name": "changed"}),
+            ("INSERT INTO datasheets (Id) VALUES (:id)", {"id": "new"}),
+            ("DROP TABLE datasheets", {}),
+            ("CREATE TABLE other (value TEXT)", {}),
             ("SELECT Id FROM datasheets; DELETE FROM datasheets", {}),
+            ("SELECT Id FROM datasheets; SELECT Id FROM datasheets", {}),
             ("ATTACH DATABASE :path AS evil", {"path": ":memory:"}),
+            ("DETACH DATABASE main", {}),
+            ("PRAGMA user_version", {}),
+            ("PRAGMA query_only = OFF", {}),
             ("SELECT load_extension(:path) FROM datasheets", {"path": "evil"}),
+            ("SELECT randomblob(:size) FROM datasheets", {"size": 100}),
             ("SELECT name FROM sqlite_master", {}),
+            ("SELECT COUNT(*) FROM sqlite_schema", {}),
             ("SELECT value FROM private_notes", {}),
-            ("SELECT d.Id FROM datasheets d CROSS JOIN factions f", {}),
-            ("SELECT CAST(t AS INTEGER) FROM datasheets_models", {}),
+            ("SELECT name FROM datasheets UNION SELECT value FROM private_notes", {}),
+            ("WITH notes AS (SELECT value FROM private_notes) SELECT value FROM notes", {}),
+            ("SELECT name FROM pragma_table_info(:table)", {"table": "datasheets"}),
+            ("WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<3) "
+             "SELECT n FROM numbers", {}),
         ]
         for sql, parameters in unsafe:
             with self.subTest(sql=sql), self.assertRaises(PolicyViolation):
-                validate_sql(sql, parameters, self.schema)
-        # Runtime protection must work even if AST validation is accidentally bypassed.
-        with closing(open_readonly(self.path)) as connection:
-            install_authorizer(connection, self.schema)
+                execute_bounded(self.path, sql, parameters)
+        # Check the authorizer directly, independently of connection-level read-only mode.
+        with closing(sqlite3.connect(self.path)) as connection:
+            install_authorizer(connection)
             for sql in ("DELETE FROM datasheets", "PRAGMA user_version", "SELECT value FROM private_notes"):
                 with self.subTest(sql=sql), self.assertRaises(sqlite3.DatabaseError):
                     connection.execute(sql).fetchall()
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM datasheets").fetchone(), (4,))
+        with closing(open_readonly(self.path)) as connection:
+            with self.assertRaises(sqlite3.OperationalError):
+                connection.execute("DELETE FROM datasheets")
+
+    def test_sqlite_handles_ctes_columns_and_distinct_counts(self):
+        sql = '''WITH infantry AS (
+            SELECT DISTINCT DatasheetId FROM datasheets_keywords WHERE keyword=:keyword
+        ) SELECT COUNT(DISTINCT d.Id) FROM datasheets d
+          INNER JOIN infantry i ON i.DatasheetId=d.Id'''
+        result = execute_bounded(self.path, sql, {"keyword": "INFANTRY"})
+        self.assertEqual(result.rows, [(2,)])
 
     def test_numeric_guard_does_not_cast_symbolic_values_to_zero(self):
-        expression = integer_expression("m.t")
-        sql = validate_sql(f"SELECT {expression} AS value FROM datasheets_models m", {}, self.schema)
-        result = execute_bounded(self.path, sql, {}, self.schema)
+        expression = INTEGER_TEMPLATE.format(column="m.t")
+        sql = f"SELECT {expression} AS value FROM datasheets_models m"
+        result = execute_bounded(self.path, sql, {})
         self.assertEqual([row[0] for row in result.rows], [10, 9, None, None, -2, None])
-        with self.assertRaises(PolicyViolation):
-            validate_sql("SELECT t FROM datasheets_models WHERE t>:minimum", {"minimum": 9}, self.schema)
+
+    def test_generated_points_and_card_ability_rules(self):
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.executescript('''
+                CREATE TABLE datasheets_models_cost (DatasheetId TEXT, description TEXT, cost TEXT);
+                INSERT INTO datasheets_models_cost VALUES
+                    ('000000001', '1 model', '80'), ('000000001', '2 models', '160');
+                CREATE TABLE abilities (Id TEXT, name TEXT, description TEXT);
+                INSERT INTO abilities VALUES ('core', 'Catalog ability', 'Catalog rules');
+                CREATE TABLE datasheets_abilities (DatasheetId TEXT, abilityId TEXT, name TEXT, description TEXT);
+                INSERT INTO datasheets_abilities VALUES
+                    ('000000001', 'core', '', ''),
+                    ('000000001', 'core', 'Override', 'Card rules'),
+                    ('000000001', '', 'Card only', 'Standalone rules');
+            ''')
+            connection.commit()
+        result, _ = self.retrieve("Warboss points for 2 models", intent(entities=[entity()]), query(
+            "SELECT description, cost FROM datasheets_models_cost "
+            "WHERE DatasheetId=:unit_id AND description=:configuration",
+            {"unit_id": "000000001", "configuration": "2 models"}))
+        self.assertEqual(result.rows, [("2 models", "160")])
+        result, _ = self.retrieve("Warboss ability names and text", intent(entities=[entity()]), query(
+            "SELECT DISTINCT COALESCE(NULLIF(da.name, ''), a.name) AS ability_name, "
+            "COALESCE(NULLIF(da.description, ''), a.description) AS ability_text "
+            "FROM datasheets_abilities da LEFT JOIN abilities a ON a.Id=da.abilityId "
+            "WHERE da.DatasheetId=:unit_id", {"unit_id": "000000001"}))
+        self.assertEqual(set(result.rows), {
+            ("Catalog ability", "Catalog rules"), ("Override", "Card rules"),
+            ("Card only", "Standalone rules"),
+        })
+
+    def test_invalid_sql_and_parameter_boundaries(self):
+        for sql in (None, "", "-- no query", "SELECT name FROM datasheets " + " " * (16 * 1024), "\ud800"):
+            with self.subTest(sql_type=type(sql)), self.assertRaises(PolicyViolation):
+                execute_bounded(self.path, sql, {})
+        for parameters in (None, [], {"value": True}, {"value": float("nan")},
+                           {"value": 2**63}, {"value": "x" * (16 * 1024 + 1)},
+                           {"value": "\ud800"}, {"bad-key": "value"}):
+            with self.subTest(parameters=parameters), self.assertRaises(PolicyViolation):
+                execute_bounded(self.path, "SELECT :value FROM datasheets", parameters)
 
     def test_result_limits_and_execution_budgets(self):
         with closing(sqlite3.connect(self.path)) as connection:
@@ -210,13 +291,21 @@ class HybridRetrievalTests(unittest.TestCase):
                 self.assertEqual(result.status, "ok", result)
                 self.assertEqual((len(result.rows), result.truncated), (count, truncated))
                 self.assertEqual(result.rows[0], ("extra-249",))
-        bounded = execute_bounded(self.path, "SELECT Id FROM datasheets", {}, self.schema,
-                                  limits=ExecutionLimits(bytes=25))
+        bounded = execute_bounded(self.path, "SELECT Id FROM datasheets", {},
+                                  limits=ExecutionLimits(bytes=50))
         self.assertTrue(bounded.truncated)
+        self.assertLessEqual(len(json.dumps(bounded.columns).encode()) +
+                             len(json.dumps(bounded.rows).encode()), 50)
+        count = execute_bounded(self.path, "SELECT COUNT(*) FROM datasheets", {})
+        self.assertEqual(count.rows, [(254,)])
+        with self.assertRaises(RetrievalFailure) as error:
+            execute_bounded(self.path, "SELECT :value FROM datasheets", {"value": "x" * 2000},
+                            limits=ExecutionLimits(bytes=64))
+        self.assertEqual(error.exception.code, "result_budget")
         for limits in (ExecutionLimits(vm_steps=10), ExecutionLimits(seconds=0)):
             with self.subTest(limits=limits), self.assertRaises(RetrievalFailure) as error:
                 execute_bounded(self.path, "SELECT COUNT(*) FROM datasheets a, datasheets b",
-                                {}, self.schema, limits=limits)
+                                {}, limits=limits)
             self.assertEqual(error.exception.code, "query_budget")
         with closing(sqlite3.connect(self.path, timeout=0.01)) as connection:
             connection.execute("BEGIN EXCLUSIVE")

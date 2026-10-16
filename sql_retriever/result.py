@@ -22,7 +22,7 @@ class RetrievalResult:
 
 
 class RetrievalFailure(Exception):
-    """A failure safe to expose without database values or user text."""
+    """A categorized retrieval failure exposed through the public result."""
 
     def __init__(self, code: str, message: str):
         super().__init__(message)

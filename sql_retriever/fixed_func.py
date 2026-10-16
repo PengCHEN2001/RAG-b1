@@ -1,15 +1,15 @@
 import json
-import sqlite3
 import sys
 
 from pathlib import Path
-from contextlib import closing
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from sql_retriver.functions import FUNCTION_REGISTRY, get_function_declarations
+    from sql_retriever.functions import FUNCTION_REGISTRY, get_function_declarations
+    from sql_retriever.safety import execute_bounded
 else:
     from .functions import FUNCTION_REGISTRY, get_function_declarations
+    from .safety import execute_bounded
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "sql" / "wahadb.sqlite"
 
@@ -83,13 +83,8 @@ def parse_function_call(response_text: str) -> tuple[str, dict[str, str]] | None
 
 
 def make_sql_query(sql: str, args: dict[str, str]) -> list[tuple]:
-    """Execute a registered SQLite query with named bindings in read-only mode."""
-    db = DB_PATH
-
-    with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
-        rows = conn.execute(sql, args).fetchall()
-
-    return rows
+    """Execute a registered query with the same access and resource limits as hybrid SQL."""
+    return execute_bounded(DB_PATH, sql, args).rows
 
 
 def sql_retrieve_fixed_funcs(query: str, *, client=None) -> list[tuple] | None:
