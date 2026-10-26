@@ -1,8 +1,8 @@
 # Combined Benchmark v1
 
-该测试集用于评估 Router 和完整编排能否在同一个问题中同时使用 SQL Retriever 与 Rulebook Retriever，并根据两个来源生成统一回答。
+This benchmark evaluates whether the router and orchestration pipeline can use both the SQL retriever and the Rulebook retriever for a single question, then produce one evidence-grounded answer from both sources.
 
-当前版本包含 2 个经过人工确认的问题。测试题复用现有的 Text-to-SQL 和 Rulebook benchmark，不使用 RAGAS 额外生成问题。
+The current version contains two manually reviewed questions. Both reuse evidence already validated in the Text-to-SQL and Rulebook benchmarks; no additional RAGAS generation is used.
 
 ## Combined-01 — Grenades
 
@@ -12,8 +12,8 @@
 
 **Required sources:**
 
-- SQL：`sql_003`
-- Rulebook：`rb_001`
+- SQL: `sql_003`
+- Rulebook: `rb_001`
 
 **Reference answer:**
 
@@ -29,8 +29,8 @@ Yes. An Imperial Space Marine has the Grenades keyword. The Grenade Stratagem co
 
 **Required sources:**
 
-- SQL：`sql_008`
-- Rulebook：`rb_003`
+- SQL: `sql_008`
+- Rulebook: `rb_003`
 
 **Reference answer:**
 
