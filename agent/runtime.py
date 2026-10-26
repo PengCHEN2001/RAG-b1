@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import traceback
+from contextlib import closing
 from dataclasses import fields
 from datetime import datetime, timezone
 from importlib.metadata import version
@@ -133,12 +134,15 @@ def _exception_info(error):
     return info
 
 
-def run_turn(graph, context, *, session_id, question, trace_dir=DEFAULT_TRACE_DIR, on_event=None):
+def run_turn(graph, context, *, session_id, question, trace_dir=DEFAULT_TRACE_DIR, on_event=None,
+             cancel_event=None):
     """Run synchronously; caller-generated session IDs are internal identifiers.
 
     The callback receives the same redacted events as disk. --trace display and
     persistence are independent. Errors/cancellation return a terminal result;
     no failed node is retried. Only the graph's completed turns enter its memory.
+    An optional threading.Event stops consumption between graph events; an
+    in-flight synchronous call must return before the stream can be closed.
     """
     started = perf_counter()
     run_id = uuid4().hex
@@ -180,37 +184,44 @@ def run_turn(graph, context, *, session_id, question, trace_dir=DEFAULT_TRACE_DI
         "trace_enabled": trace_dir is not None, "llm_calls": None, "usage": None,
     })
     try:
-        for task in graph.stream({"user_input": question, "run_id": run_id}, config,
-                                 context=context, stream_mode="tasks"):
-            task_id, node = task["id"], task["name"]
-            if "input" in task:
-                active[task_id] = (node, perf_counter())
-                emit("step.started", {"input": task["input"]}, node=node, span_id=task_id)
-                continue
-            _, step_started = active.pop(task_id)
-            duration = (perf_counter() - step_started) * 1000
-            durations[node] = duration
-            if task["error"] is not None:
-                failed_node = node
-                emit("step.failed", {"duration_ms": duration, "error": "Node failed; see run.finished error details."},
-                     node=node, span_id=task_id)
-                continue
-            update = task["result"]
-            prepared = prepared or node == "prepare_turn"
-            emit("step.finished", {"duration_ms": duration, "update": update}, node=node, span_id=task_id)
-            if node == "plan" or node == "prepare_rulebook_query":
-                emit("route.selected" if node == "plan" else "query.refined", update, node=node, span_id=task_id)
-            if node in ("retrieve_sql", "retrieve_rulebook"):
-                if node == "retrieve_sql":
-                    result = update["sql_result"]
-                    summary = {"source": "sql", "status": result.status, "strategy": result.strategy,
-                               "count": len(result.rows), "truncated": result.truncated, "error_code": result.error_code}
+        if cancel_event is not None and cancel_event.is_set():
+            raise KeyboardInterrupt
+        with closing(graph.stream({"user_input": question, "run_id": run_id}, config,
+                                  context=context, stream_mode="tasks")) as stream:
+            for task in stream:
+                task_id, node = task["id"], task["name"]
+                if "input" in task:
+                    active[task_id] = (node, perf_counter())
+                    emit("step.started", {"input": task["input"]}, node=node, span_id=task_id)
                 else:
-                    result = update.get("rulebook_result")
-                    summary = {"source": "rulebook", "status": "error" if result is None else "ok" if result.results else "empty",
-                               "count": len(result.results) if result is not None else 0,
-                               "errors": update.get("retrieval_errors", {})}
-                emit("retrieval.completed", summary, node=node, span_id=task_id)
+                    _, step_started = active.pop(task_id)
+                    duration = (perf_counter() - step_started) * 1000
+                    durations[node] = duration
+                    if task["error"] is not None:
+                        failed_node = node
+                        emit("step.failed", {"duration_ms": duration, "error": "Node failed; see run.finished error details."},
+                             node=node, span_id=task_id)
+                    else:
+                        update = task["result"]
+                        prepared = prepared or node == "prepare_turn"
+                        emit("step.finished", {"duration_ms": duration, "update": update}, node=node, span_id=task_id)
+                        if node == "plan" or node == "prepare_rulebook_query":
+                            emit("route.selected" if node == "plan" else "query.refined", update, node=node, span_id=task_id)
+                        if node in ("retrieve_sql", "retrieve_rulebook"):
+                            if node == "retrieve_sql":
+                                result = update["sql_result"]
+                                summary = {"source": "sql", "status": result.status, "strategy": result.strategy,
+                                           "count": len(result.rows), "truncated": result.truncated, "error_code": result.error_code}
+                            else:
+                                result = update.get("rulebook_result")
+                                summary = {"source": "rulebook", "status": "error" if result is None else "ok" if result.results else "empty",
+                                           "count": len(result.results) if result is not None else 0,
+                                           "errors": update.get("retrieval_errors", {})}
+                            emit("retrieval.completed", summary, node=node, span_id=task_id)
+                # Finalize is the atomic memory commit. A cancellation arriving
+                # after it starts is too late; report the committed outcome.
+                if cancel_event is not None and cancel_event.is_set() and node != "finalize":
+                    raise KeyboardInterrupt
         state = graph.get_state(config).values
         outcome = state["outcome"]
     except (Exception, KeyboardInterrupt) as failure:

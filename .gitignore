@@ -233,6 +233,9 @@ evaluation/datasets/rulebook_candidates.md
 # Placeholder only; remove this rule when the evaluation protocol is ready.
 docs/eval_protocol.md
 
+# Local conversation/debug traces, retained across CLI sessions.
+data/traces/
+
 
 .python-version
 .DS_Store
