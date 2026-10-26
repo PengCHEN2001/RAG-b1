@@ -2,29 +2,61 @@
 
 ## Quick start
 
-Run the complete benchmark without RAGAS judge metrics:
+Run all 20 cases with the real Agent, but without the additional RAGAS judge:
 
 ```bash
 uv run --env-file .env python -m evaluation.run --dataset all
 ```
 
-Run the complete benchmark and enable the RAGAS evaluation of Rulebook answers:
+This command measures Rulebook chunk retrieval, SQL result accuracy, Router
+classification, combined-source orchestration, failures, and latency. The Agent
+still uses Gemini for routing and answer generation; only the extra RAGAS judge
+calls are disabled.
+
+Run the same 20 cases and additionally judge the six Rulebook answers with RAGAS:
 
 ```bash
 uv run --group eval --env-file .env \
   python -m evaluation.run --dataset all --ragas
 ```
 
-Each benchmark can also be run separately:
+This adds Context Precision, Context Recall, Faithfulness, Response Relevancy,
+and Factual Correctness. It requires the evaluation dependency group and makes
+additional Gemini calls.
+
+Each benchmark can also be isolated:
 
 ```bash
+# Six Rulebook questions: routing plus Hit@5, Precision@5, Recall@5, and MRR.
 uv run --env-file .env python -m evaluation.run --dataset rulebook
+
+# The same Rulebook cases plus the five RAGAS judge metrics.
+uv run --group eval --env-file .env \
+  python -m evaluation.run --dataset rulebook --ragas
+
+# Twelve SQL questions: routing, returned status, columns, rows, errors, and latency.
 uv run --env-file .env python -m evaluation.run --dataset text2sql
+
+# Two combined questions: the `both` route and evidence from both data sources.
 uv run --env-file .env python -m evaluation.run --dataset combined
 ```
 
 The runner creates a unique run directory and prints the paths of the generated
 raw results, summary, failure list, and Markdown report.
+
+## Document outline
+
+1. **Purpose** — defines the questions that the evaluation must answer.
+2. **Evaluation workflow** — shows how datasets, the Agent, metrics, and reports connect.
+3. **Design principles** — explains why the evaluation is layered, project-specific, and reproducible.
+4. **Files and responsibilities** — identifies the datasets, evaluation code, source data, and tests.
+5. **Benchmark datasets** — describes the 6 Rulebook, 12 Text-to-SQL, and 2 combined cases.
+6. **Rulebook evaluation** — explains test-set construction, retrieval metrics, and RAGAS metrics.
+7. **Text-to-SQL evaluation** — explains result comparison, status handling, and SQL metrics.
+8. **Router and combined evaluation** — defines route scoring and two-source success criteria.
+9. **Runtime records and performance** — describes traces, latency, model calls, and token fields.
+10. **Execution and outputs** — defines the run sequence and the four generated result files.
+11. **Reproducibility and limitations** — records configuration requirements and interpretation limits.
 
 ## 1. Purpose
 
@@ -266,10 +298,16 @@ appropriate for direct inspection in the final report.
 
 ## 9. Runtime records and performance
 
-The application retains one structured trace per case. The evaluation adapter
-extracts the user question, selected route, SQL result, ranked Rulebook chunks,
-final answer, citations, outcome, errors, total latency, and node timings. The
-trace contains structured execution events, not private model reasoning.
+Trace generation belongs to the application runtime, not to the evaluation
+layer. The existing Agent runtime retains one structured trace for each case.
+The evaluation code only reads that trace through `trace_adapter.py` and converts
+the existing fields into a consistent evaluation record. It does not redefine
+the Agent's internal result objects or duplicate its tracing logic.
+
+From the trace, the adapter extracts the user question, selected route, SQL
+result, ranked Rulebook chunks, final answer, citations, outcome, errors, total
+latency, and node timings. The trace contains structured execution events, not
+private model reasoning.
 
 The runtime record also reserves fields for model-call count, input tokens,
 output tokens, and first-token latency. When a provider or application layer
