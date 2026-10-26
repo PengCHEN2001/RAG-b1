@@ -95,7 +95,7 @@ def sql_retrieve_fixed_funcs(query: str, *, client=None) -> list[tuple] | None:
         client = llm_client
 
     response = client.models.generate_content(
-        model="gemini-3.1-flash-lite",
+        model="gemini-3.5-flash-lite",
         contents=query,
         config={
             "system_instruction": FIXED_FUNC_SYSTEM_PROMPT,

@@ -226,6 +226,13 @@ data/processed/*
 # Local, rebuildable vector and BM25 indexes.
 data/indexes/
 
+# Intermediate RAGAS output; the reviewed rulebook_v1 files are committed.
+evaluation/datasets/rulebook_candidates.jsonl
+evaluation/datasets/rulebook_candidates.md
+
+# Placeholder only; remove this rule when the evaluation protocol is ready.
+docs/eval_protocol.md
+
 
 .python-version
 .DS_Store

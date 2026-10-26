@@ -243,7 +243,7 @@ def retrieve_sql(
         *, 
         client=None, 
         db_path=None,
-        model: str = "gemini-3.1-flash-lite",
+        model: str = "gemini-3.5-flash-lite",
         timing: bool = True,
     ) -> RetrievalResult:
 
