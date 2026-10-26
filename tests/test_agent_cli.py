@@ -118,7 +118,7 @@ class AgentCLITests(unittest.TestCase):
         self.context.client.api_key = "injected-private-key"
         self.context.client.models.generate_content.side_effect = RuntimeError("Authorization: Bearer foreign-secret")
         received = []
-        with patch.dict("os.environ", {"LLM_API_KEY": "configured-private-key"}):
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "configured-private-key"}):
             result = run_turn(self.graph, self.context, session_id="private", question="configured-private-key injected-private-key",
                               trace_dir=self.root, on_event=received.append)
         content = result["trace_path"].read_text()

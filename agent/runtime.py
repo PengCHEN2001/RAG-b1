@@ -156,8 +156,7 @@ def run_turn(graph, context, *, session_id, question, trace_dir=DEFAULT_TRACE_DI
     def emit(event, payload, *, node=None, span_id=None):
         nonlocal seq, warned
         seq += 1
-        secrets = [os.getenv(name) for name in ("LLM_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY")]
-        secrets.append(getattr(context.client, "api_key", None))
+        secrets = [os.getenv("GOOGLE_API_KEY"), getattr(context.client, "api_key", None)]
         # ponytail: inline node snapshots; use shared content-addressed blobs if
         # measured trace size makes repeated evidence snapshots expensive.
         record = trace_value({
