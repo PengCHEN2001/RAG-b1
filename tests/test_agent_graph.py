@@ -96,10 +96,12 @@ class EvidenceGraphTests(unittest.TestCase):
             with closing(sqlite3.connect(path)) as connection:
                 connection.executescript('''
                     CREATE TABLE factions (Id TEXT, name TEXT);
+                    CREATE TABLE source (Id TEXT, name TEXT);
                     CREATE TABLE datasheets (Id TEXT, name TEXT, factionId TEXT,
-                        role TEXT, legend TEXT, link TEXT);
+                        role TEXT, legend TEXT, link TEXT, sourceId TEXT DEFAULT '');
                     INSERT INTO factions VALUES ('ORK', 'Orks');
-                    INSERT INTO datasheets VALUES ('000000001', 'Warboss', 'ORK', '', '', 'source');
+                    INSERT INTO datasheets (Id, name, factionId, role, legend, link)
+                    VALUES ('000000001', 'Warboss', 'ORK', '', '', 'source');
                 ''')
             self.context.sql_retriever = None
             self.context.rulebook_retriever = RulebookRetriever(

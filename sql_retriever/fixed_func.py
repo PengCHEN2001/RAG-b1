@@ -5,10 +5,10 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from sql_retriever.functions import FUNCTION_REGISTRY, get_function_declarations
+    from sql_retriever.functions import FUNCTION_REGISTRY, build_fixed_query, get_function_declarations
     from sql_retriever.safety import execute_bounded
 else:
-    from .functions import FUNCTION_REGISTRY, get_function_declarations
+    from .functions import FUNCTION_REGISTRY, build_fixed_query, get_function_declarations
     from .safety import execute_bounded
 
 from llm.instrumentation import generate_content
@@ -47,7 +47,6 @@ response_schema = {
 }
 
 
-
 def parse_function_call(response_text: str) -> tuple[str, dict[str, str]] | None:
     """Validate a model selection, then build SQL without executing it."""
 
@@ -59,29 +58,11 @@ def parse_function_call(response_text: str) -> tuple[str, dict[str, str]] | None
     name = selection["name"]
     arguments = selection["arguments"]
 
-    if not isinstance(arguments, dict):
-        raise ValueError("arguments must be an object")
     if name is None:
-        if arguments:
+        if arguments != {}:
             raise ValueError("A null function name requires empty arguments")
         return None
-    if not isinstance(name, str) or name not in FUNCTION_REGISTRY:
-        raise ValueError("Unknown function name")
-
-    spec = FUNCTION_REGISTRY[name]
-    parameters = spec["parameters"]
-
-
-    if set(parameters["required"]) - arguments.keys():
-        raise ValueError("Missing required function arguments")
-    if arguments.keys() - parameters["properties"].keys():
-        raise ValueError("Unexpected function arguments")
-    # Current registered parameters are strings. Extend this validation when
-    # introducing other parameter types; schema adherence alone is insufficient.
-    if any(not isinstance(value, str) or not value.strip() for value in arguments.values()):
-        raise ValueError("Function arguments must be non-empty strings")
-
-    return spec["function"](**arguments)
+    return build_fixed_query(name, arguments)
 
 
 def make_sql_query(sql: str, args: dict[str, str]) -> list[tuple]:

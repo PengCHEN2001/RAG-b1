@@ -89,7 +89,7 @@ class AgentResponseTests(unittest.TestCase):
             {"role": "human", "content": first["user_input"]}, {"role": "ai", "content": first["answer"]},
         ])
         self.assertEqual(planning_payload["conversation_context"], first["conversation_context"])
-        self.sql.assert_called_with("Get Toughness for Warboss ID 000000001")
+        self.sql.assert_called_with("What is the Toughness of Warboss ID 000000001?")
         self.assertEqual(len(second["messages"]), 4)
         self.assertEqual(second["citations"]["S1"]["source_id"], "run-2:sql")
         self.assertEqual(second["conversation_context"], first["conversation_context"])
@@ -104,6 +104,8 @@ class AgentResponseTests(unittest.TestCase):
         for number, candidate in enumerate(candidates, 1):
             self.assertIn(f"{number}. {json.dumps(candidate, ensure_ascii=False)}", first["answer"])
         self.assertEqual(first["pending_clarification"]["candidates"], candidates)
+        payload = json.loads(self.context.client.models.generate_content.call_args.kwargs["contents"])
+        self.assertEqual(payload["pending_candidates"], candidates)
         self.rules.retrieve.assert_not_called()
         self.sql.return_value = RetrievalResult("ok", columns=["datasheet_name", "ability_text"], rows=[("Boyz", "Feel No Pain")])
         second = self.invoke(planning_output(

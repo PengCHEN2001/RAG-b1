@@ -38,7 +38,7 @@ class FixedFunctionTests(unittest.TestCase):
             con.execute("CREATE TABLE abilities (Id, name, description, factionId)")
             con.executemany("INSERT INTO abilities VALUES (?, ?, ?, ?)", [
                 ("ability1", "Core ability", "Catalog rules", "ORK"),
-                ("ability1", "Core ability", "Catalog rules", "TYR"),
+                ("ability1", "Core ability", "Enemy catalog rules", "TYR"),
             ])
             con.execute("CREATE TABLE datasheets_abilities (DatasheetId, abilityId, name, description)")
             con.executemany("INSERT INTO datasheets_abilities VALUES (?, ?, ?, ?)", [
@@ -148,6 +148,7 @@ class FixedFunctionTests(unittest.TestCase):
             {"name": "get_unit_all_metadata", "arguments": {"d_id": " "}},
             {"name": "get_unit_all_metadata", "arguments": {"d_id": "1", "sql": "SELECT 1"}},
             {"name": None, "arguments": {"d_id": "1"}},
+            {"name": None, "arguments": []},
             {"name": "get_units_by_faction", "arguments": {"d_id": "1"}},
             {"name": "get_units_by_faction", "arguments": {"faction_id": "ORK", "role": 1}},
             {"name": "get_detachments_and_abilities", "arguments": {}},

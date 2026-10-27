@@ -45,13 +45,18 @@ class HybridRetrievalTests(unittest.TestCase):
         with closing(sqlite3.connect(self.path)) as connection:
             connection.executescript('''
                 CREATE TABLE factions (Id TEXT, name TEXT);
+                CREATE TABLE source (Id TEXT, name TEXT);
                 CREATE TABLE datasheets (Id TEXT, name TEXT, factionId TEXT,
-                    role TEXT, legend TEXT, link TEXT);
+                    role TEXT, legend TEXT, link TEXT, sourceId TEXT DEFAULT '');
                 CREATE TABLE datasheets_keywords (DatasheetId TEXT, keyword TEXT);
-                CREATE TABLE datasheets_models (DatasheetId TEXT, name TEXT, t TEXT);
+                CREATE TABLE datasheets_models (
+                    DatasheetId TEXT, name TEXT, t TEXT, line TEXT DEFAULT '', m TEXT DEFAULT '',
+                    sv TEXT DEFAULT '', invSv TEXT DEFAULT '', invSvDescr TEXT DEFAULT '', w TEXT DEFAULT '',
+                    ld TEXT DEFAULT '', oc TEXT DEFAULT ''
+                );
                 CREATE TABLE private_notes (value TEXT);
                 INSERT INTO factions VALUES ('ORK', 'Orks'), ('TYR', 'Tyranids');
-                INSERT INTO datasheets VALUES
+                INSERT INTO datasheets (Id, name, factionId, role, legend, link) VALUES
                     ('000000001', 'Warboss', 'ORK', '', '', ''),
                     ('000000002', 'Boyz', 'ORK', '', '', ''),
                     ('000000003', 'Boyz', 'TYR', '', '', ''),
@@ -59,7 +64,7 @@ class HybridRetrievalTests(unittest.TestCase):
                 INSERT INTO datasheets_keywords VALUES
                     ('000000001', 'INFANTRY'), ('000000001', 'INFANTRY'),
                     ('000000002', 'INFANTRY');
-                INSERT INTO datasheets_models VALUES
+                INSERT INTO datasheets_models (DatasheetId, name, t) VALUES
                     ('000000001', 'Warboss', '10'), ('000000002', 'Boyz', '9'),
                     ('000000003', 'Dice', 'D6'), ('000000004', 'Empty', ''),
                     ('000000001', 'Signed', '-2'), ('000000002', 'Save', '2+');
@@ -86,13 +91,32 @@ class HybridRetrievalTests(unittest.TestCase):
                 self.assertEqual(client.models.generate_content.call_count, 1)
 
     def test_ambiguous_or_unknown_names_stop_before_generation(self):
-        for name, count in [("Boyz", 2), ("Warbos", 0)]:
+        for name, count in [("Boyz", 2), ("Quantum Banana Cruiser", 0)]:
             with self.subTest(name=name):
                 result, client = self.retrieve(f"Get {name} metadata", intent(
                     "fixed", "get_unit_all_metadata", {"d_id": "@unit"}, [entity(value=name)]))
                 self.assertEqual(result.status, "needs_clarification")
                 self.assertEqual(len(result.candidates), count)
                 self.assertEqual(client.models.generate_content.call_count, 1)
+
+    def test_fixed_model_stats_return_all_profiles_and_preserve_symbolic_values(self):
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute('''UPDATE datasheets_models SET m='6"', sv='3+', invSv='5+', invSvDescr='Against ranged attacks',
+                w='4', ld='6+', oc='1', line=CASE name WHEN 'Warboss' THEN '1' ELSE '2' END
+                WHERE DatasheetId='000000001' ''')
+            connection.commit()
+        result, client = self.retrieve("What is the Toughness of Warboss?", intent(
+            "fixed", "get_unit_model_stats", {"d_id": "@unit"}, [entity()]))
+        self.assertEqual((result.status, result.strategy), ("ok", "fixed"), result)
+        self.assertEqual(result.parameters, {"d_id": "000000001"})
+        profiles = [dict(zip(result.columns, row)) for row in result.rows]
+        self.assertEqual([(profile["model_name"], profile["toughness"]) for profile in profiles],
+                         [("Warboss", "10"), ("Signed", "-2")])
+        for profile in profiles:
+            self.assertEqual((profile["movement"], profile["save"], profile["invulnerable_save"],
+                              profile["leadership"]), ('6"', '3+', '5+', '6+'))
+            self.assertEqual(profile["invulnerable_save_description"], 'Against ranged attacks')
+        client.models.generate_content.assert_called_once()
 
     def test_generated_route_executes_grounded_numeric_query(self):
         numeric_toughness = INTEGER_TEMPLATE.format(column="m.t")
@@ -122,10 +146,12 @@ class HybridRetrievalTests(unittest.TestCase):
             self.assertEqual(reference, dictionary)
 
     def test_compilation_repair_is_limited_to_one_attempt(self):
-        invalid = query("SELECT imaginary FROM datasheets")
-        for correction, expected in [(query("SELECT name FROM datasheets"), "ok"), (invalid, "error")]:
+        parameters = {"unit_id": "000000001"}
+        invalid = query("SELECT imaginary FROM datasheets WHERE Id=:unit_id", parameters)
+        valid = query("SELECT name FROM datasheets WHERE Id=:unit_id", parameters)
+        for correction, expected in [(valid, "ok"), (invalid, "error")]:
             with self.subTest(expected=expected):
-                result, client = self.retrieve("List unit names", intent(), invalid, correction)
+                result, client = self.retrieve("Warboss name", intent(entities=[entity()]), invalid, correction)
                 self.assertEqual(result.status, expected)
                 self.assertEqual(client.models.generate_content.call_count, 3)
                 if expected == "error":
@@ -133,6 +159,23 @@ class HybridRetrievalTests(unittest.TestCase):
                 repair = json.loads(client.models.generate_content.call_args.kwargs["contents"])["repair"]
                 self.assertIn("imaginary", repair["message"])
                 self.assertEqual(repair["error_code"], "sql_compilation")
+                self.assertEqual(repair["sql"], invalid["sql"])
+                self.assertEqual(repair["parameters"], parameters)
+                self.assertEqual(set(repair), {"error_code", "message", "sql", "parameters"})
+                payload = json.loads(client.models.generate_content.call_args.kwargs["contents"])
+                self.assertEqual(payload["required_bindings"], parameters)
+
+        # Parser failures get the same single repair, and a repaired policy violation still stops.
+        malformed = query("SELECT name FROM datasheets WHERE (Id=:unit_id", parameters)
+        bypass = query("SELECT name FROM datasheets WHERE Id=:unit_id OR 1=1", parameters)
+        for corrected, expected in [(valid, None), (bypass, "sql_policy")]:
+            result, client = self.retrieve("Warboss name", intent(entities=[entity()]), malformed, corrected)
+            self.assertEqual(result.error_code, expected)
+            if expected is None:
+                self.assertEqual(result.rows, [("Warboss",)])
+            self.assertEqual(client.models.generate_content.call_count, 3)
+            repair = json.loads(client.models.generate_content.call_args.kwargs["contents"])["repair"]
+            self.assertEqual((repair["sql"], repair["parameters"]), (malformed["sql"], parameters))
 
     def test_empty_policy_and_budget_failures_do_not_retry(self):
         cases = [
@@ -186,6 +229,70 @@ class HybridRetrievalTests(unittest.TestCase):
         result, _ = self.retrieve("Warboss model stats", intent(entities=[entity()]), query(
             "SELECT name FROM datasheets_models WHERE DatasheetId=:unit_id", {"unit_id": "000000002"}))
         self.assertEqual(result.error_code, "sql_policy")
+
+    def test_identity_mentions_cannot_bypass_effective_filters(self):
+        queries = [
+            "SELECT name FROM datasheets WHERE Id='000000002'",
+            "SELECT :unit_id, name FROM datasheets WHERE Id='000000002'",
+            "SELECT ':unit_id', name FROM datasheets WHERE Id='000000002'",
+            "SELECT name FROM datasheets WHERE Id='000000002' -- Id=:unit_id",
+            "SELECT name FROM datasheets WHERE name=:unit_id",
+            "SELECT name FROM factions WHERE Id=:unit_id",
+            "SELECT name FROM datasheets WHERE :unit_id=:unit_id",
+            "SELECT name FROM datasheets WHERE Id<>:unit_id",
+            "SELECT name FROM datasheets WHERE Id=:unit_id OR 1=1",
+            "SELECT name FROM datasheets WHERE NOT (Id=:unit_id)",
+            "SELECT CASE WHEN Id=:unit_id THEN name END FROM datasheets",
+            "SELECT name FROM datasheets WHERE Id IN (:unit_id, :other)",
+            "SELECT name FROM datasheets WHERE Id IN (:unit_id, '000000002')",
+            "WITH unused AS (SELECT name FROM datasheets WHERE Id=:unit_id) "
+            "SELECT name FROM datasheets WHERE Id='000000002'",
+            "SELECT d.name FROM datasheets d WHERE EXISTS "
+            "(SELECT x.Id FROM datasheets x WHERE x.Id=:unit_id)",
+            "SELECT (SELECT name FROM datasheets WHERE Id=:unit_id), name FROM datasheets",
+            "SELECT d.name FROM datasheets d LEFT JOIN factions f "
+            "ON f.Id=d.factionId AND d.Id=:unit_id",
+            "WITH chosen AS (SELECT Id FROM datasheets WHERE Id=:unit_id) "
+            "SELECT d.name FROM datasheets d LEFT JOIN chosen c ON c.Id=d.Id",
+            "SELECT name FROM datasheets WHERE Id=:unit_id UNION ALL "
+            "SELECT name FROM datasheets WHERE Id='000000002'",
+            "WITH datasheets AS (SELECT '000000001' AS Id, 'Wrong' AS name) "
+            "SELECT name FROM datasheets WHERE Id=:unit_id",
+        ]
+        for sql in queries:
+            with self.subTest(sql=sql), patch("sql_retriever.hybrid.execute_bounded") as execute:
+                result, client = self.retrieve("Warboss name", intent(entities=[entity()]),
+                                               query(sql, {"unit_id": "000000001", "other": "000000002"}))
+                self.assertEqual(result.error_code, "sql_policy", result)
+                self.assertEqual(client.models.generate_content.call_count, 2)
+                execute.assert_not_called()
+
+    def test_effective_identity_filters_support_joins_ctes_and_resolved_lists(self):
+        queries = [
+            "SELECT name FROM datasheets WHERE :unit_id=Id",
+            'SELECT D.name FROM datasheets D WHERE D."ID"=:unit_id',
+            "SELECT d.name FROM datasheets d JOIN factions f "
+            "ON f.Id=d.factionId AND d.Id=:unit_id",
+            "SELECT d.name FROM datasheets d LEFT JOIN factions f "
+            "ON f.Id=d.factionId WHERE d.Id=:unit_id",
+            "SELECT name FROM datasheets WHERE "
+            "(Id=:unit_id AND name='Warboss') OR (Id=:unit_id AND name='Other')",
+            "WITH chosen AS (SELECT name FROM datasheets WHERE Id=:unit_id) SELECT name FROM chosen",
+            "SELECT name FROM (SELECT name FROM datasheets WHERE Id=:unit_id) chosen",
+            "SELECT name FROM datasheets WHERE Id=:unit_id UNION "
+            "SELECT name FROM datasheets WHERE Id=:unit_id",
+        ]
+        for sql in queries:
+            with self.subTest(sql=sql):
+                result, _ = self.retrieve("Warboss name", intent(entities=[entity()]),
+                                          query(sql, {"unit_id": "000000001"}))
+                self.assertEqual(result.status, "ok", result)
+                self.assertEqual(result.rows, [("Warboss",)])
+        result, _ = self.retrieve("Warboss and Gretchin names", intent(entities=[
+            entity(), entity("other", "unit", "Gretchin")]), query(
+                "SELECT name FROM datasheets WHERE Id IN (:unit_id, :other_id) ORDER BY Id",
+                {"unit_id": "000000001", "other_id": "000000004"}))
+        self.assertEqual(result.rows, [("Warboss",), ("Gretchin",)], result)
 
     def test_runtime_authorizer_rejects_unsafe_access(self):
         unsafe = [
@@ -281,7 +388,8 @@ class HybridRetrievalTests(unittest.TestCase):
 
     def test_result_limits_and_execution_budgets(self):
         with closing(sqlite3.connect(self.path)) as connection:
-            connection.executemany("INSERT INTO datasheets VALUES (?, ?, 'ORK', '', '', '')",
+            connection.executemany("INSERT INTO datasheets (Id, name, factionId, role, legend, link) "
+                                   "VALUES (?, ?, 'ORK', '', '', '')",
                                    [(f"extra-{number:03}", str(number)) for number in range(250)])
             connection.commit()
         for limit, count, truncated in [("", 200, True), (" LIMIT 3", 3, False)]:

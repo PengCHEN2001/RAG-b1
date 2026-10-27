@@ -44,9 +44,12 @@ class LLMUsageTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as connection:
             connection.executescript("""
                 CREATE TABLE factions (Id TEXT, name TEXT);
-                CREATE TABLE datasheets (Id TEXT, name TEXT, factionId TEXT, role TEXT, legend TEXT, link TEXT);
+                CREATE TABLE source (Id TEXT, name TEXT);
+                CREATE TABLE datasheets (Id TEXT, name TEXT, factionId TEXT, role TEXT, legend TEXT, link TEXT,
+                    sourceId TEXT DEFAULT '');
                 INSERT INTO factions VALUES ('ORK', 'Orks');
-                INSERT INTO datasheets VALUES ('000000001', 'Warboss', 'ORK', '', '', '');
+                INSERT INTO datasheets (Id, name, factionId, role, legend, link)
+                VALUES ('000000001', 'Warboss', 'ORK', '', '', '');
             """)
             connection.commit()
         self.graph = build_agent_graph()

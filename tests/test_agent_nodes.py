@@ -132,6 +132,16 @@ class AgentNodeTests(unittest.TestCase):
         self.assertIsNone(result["route_plan"]["sql_question"])
         client.models.generate_content.assert_called_once()
 
+    def test_sql_route_uses_the_full_question_instead_of_a_second_model_written_query(self):
+        question = "What is the Toughness of an Imperial Space Marine?"
+        client = client_for(planning_output(
+            standalone_question=question,
+            sql_question="SELECT toughness FROM units WHERE name='Imperial Space Marine' OR name LIKE '%Space Marine%'",
+        ))
+        result = plan({"user_input": question}, client=client)
+        self.assertEqual(result["route_plan"]["sql_question"], question)
+        client.models.generate_content.assert_called_once()
+
     def test_followup_passes_history_conditions_and_exact_candidates_once(self):
         pending = {
             "question": "Show Boyz stats", "message": "Which unit?", "source_run_id": "run-1",

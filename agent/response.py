@@ -39,6 +39,8 @@ or failed sources when answering an independent part of a mixed request.
 
 For needs_clarification, ask the supplied pending question in the user's language;
 do not answer game facts, choose an entity, list/reorder candidates or invent choices.
+Use the supplied pending_candidates to identify whether the choices are units,
+factions, sources or abilities; do not describe faction candidates as units.
 The application appends the exact numbered candidates. For unsupported, explain the
 supplied limitation. For direct, greet or describe capabilities: Core Rules and
 stored unit facts, with citations; no live news, writes or damage calculations.
@@ -180,6 +182,7 @@ def respond(state: AgentState, *, client=None, model: str = DEFAULT_MODEL,
             "sql_message": sql.message if sql is not None else None,
             "retrieval_errors": state["retrieval_errors"],
             "pending_question": pending["message"] if status == "needs_clarification" else None,
+            "pending_candidates": pending["candidates"] if status == "needs_clarification" else [],
             "sql_memory": sql_memory,
         }, ensure_ascii=False, default=lambda blob: {"bytes_hex": blob.hex()}),
         config={

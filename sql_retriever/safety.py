@@ -88,10 +88,7 @@ def install_authorizer(connection: sqlite3.Connection) -> None:
     connection.set_authorizer(authorize)
 
 
-def execute_bounded(path: Path, sql: str, parameters: dict,
-                    *, limits: ExecutionLimits = ExecutionLimits()) -> ExecutedQuery:
-    """Let SQLite compile one statement, authorize its operations, and bound its results."""
-    validate_parameters(parameters)
+def validate_sql(sql: object) -> str:
     if not isinstance(sql, str) or not sql.strip():
         raise PolicyViolation("SQL must be non-empty and at most 16 KiB.")
     try:
@@ -100,6 +97,14 @@ def execute_bounded(path: Path, sql: str, parameters: dict,
         raise PolicyViolation("SQL is not valid Unicode text.") from exc
     if size > 16 * 1024:
         raise PolicyViolation("SQL must be non-empty and at most 16 KiB.")
+    return sql
+
+
+def execute_bounded(path: Path, sql: str, parameters: dict,
+                    *, limits: ExecutionLimits = ExecutionLimits()) -> ExecutedQuery:
+    """Let SQLite compile one statement, authorize its operations, and bound its results."""
+    validate_parameters(parameters)
+    validate_sql(sql)
 
     started = time.monotonic()
     steps = 0
