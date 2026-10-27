@@ -18,8 +18,7 @@ class EvaluationRunnerTests(unittest.TestCase):
         self.output = Path(directory.name)
         self.datasets = load_benchmarks()
 
-    @staticmethod
-    def successful_result(dataset, case):
+    def successful_result(self, dataset, case):
         expected_route = (
             "rulebook" if dataset == "rulebook"
             else "both" if dataset == "combined"
@@ -40,14 +39,31 @@ class EvaluationRunnerTests(unittest.TestCase):
                 "rows": case["expected_rows"],
             }
         elif dataset == "combined":
-            rulebook_results = [{"chunk": {"chunk_id": "reference", "text": "Rule evidence"}}]
-            sql_result = {"status": "ok", "columns": ["value"], "rows": [["2"]]}
+            sql_case = next(
+                item for item in self.datasets.text2sql
+                if item["case_id"] == case["sql_reference_case_ids"][0]
+            )
+            sql_result = {
+                "status": sql_case["expected_status"],
+                "columns": sql_case["expected_columns"],
+                "rows": sql_case["expected_rows"],
+            }
+            reference_ids = set(case["rulebook_reference_case_ids"])
+            rulebook_results = [
+                {"chunk": {"chunk_id": context["chunk_id"], "text": context["text"]}}
+                for item in self.datasets.rulebook
+                if item["case_id"] in reference_ids
+                for context in item["reference_contexts"]
+            ]
+        combined = dataset == "combined"
         return {
             "route": expected_route,
             "rulebook_results": rulebook_results,
             "sql_result": sql_result,
             "answer": case.get("reference_answer", "Expected status response"),
             "outcome": "unsupported" if expected_route == "unsupported" else "completed",
+            "retrievers_called": ["sql", "rulebook"] if combined else [],
+            "citation_sources": ["sql", "rulebook"] if combined else [],
             "duration_ms": 10.0,
             "error": None,
         }
@@ -134,6 +150,43 @@ class EvaluationRunnerTests(unittest.TestCase):
             ),
             {},
         )
+
+    def test_combined_requires_two_successful_retrievers_and_both_citations(self):
+        mutations = {
+            "wrong_route": lambda result: result.update(route="sql"),
+            "sql_error": lambda result: result.update(
+                sql_result={"status": "error", "columns": [], "rows": []}
+            ),
+            "wrong_rulebook_chunk": lambda result: result.update(
+                rulebook_results=[{"chunk": {"chunk_id": "wrong", "text": "Wrong"}}]
+            ),
+            "one_retriever": lambda result: result.update(retrievers_called=["sql"]),
+            "one_citation_source": lambda result: result.update(citation_sources=["sql"]),
+        }
+        for index, (name, mutate) in enumerate(mutations.items(), 1):
+            with self.subTest(name=name):
+                def failing_executor(dataset, case, mutation=mutate):
+                    result = self.successful_result(dataset, case)
+                    mutation(result)
+                    return result
+
+                paths = run_evaluation(
+                    selection="combined",
+                    output_root=self.output,
+                    run_id=f"combined-failure-{index}",
+                    model="test-model",
+                    use_ragas=False,
+                    judge_model="judge-model",
+                    embedding_model="embedding-model",
+                    executor=failing_executor,
+                    datasets=self.datasets,
+                )
+                records = [
+                    json.loads(line)
+                    for line in paths.raw_results.read_text().splitlines()
+                ]
+                self.assertEqual(len(records), 2)
+                self.assertTrue(all(not record["benchmark_passed"] for record in records))
 
     def test_invalid_dataset_is_retained_as_invalid_case(self):
         with patch(

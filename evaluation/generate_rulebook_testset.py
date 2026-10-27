@@ -16,6 +16,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from llm.llm_config import get_gemini_model
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHUNKS = ROOT / "data/processed/Core Rules.chunks.jsonl"
@@ -331,7 +333,7 @@ def main() -> None:
             "and do not commit .env."
         )
 
-    model = args.model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    model = get_gemini_model(args.model)
     embedding_model = args.embedding_model or os.getenv(
         "RAGAS_EMBEDDING_MODEL", "models/gemini-embedding-001"
     )

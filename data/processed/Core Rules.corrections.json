@@ -1,0 +1,12 @@
+[
+  {
+    "correction_id": "core-rules-page-42-grenade-cost",
+    "chunk_id": "core-rules-grenade-001-001",
+    "pdf_page_number": 42,
+    "operation": "insert_after",
+    "anchor": "CORE - WARGEAR STRATAGEM",
+    "text": "COST: 1CP",
+    "source_evidence": "The Grenade rule block displays a visual 1CP cost label on PDF page 42.",
+    "reason": "Docling extracted the rule text but did not associate the visual cost label with the Grenade section."
+  }
+]

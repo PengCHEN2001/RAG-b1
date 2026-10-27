@@ -12,6 +12,7 @@ else:
     from .safety import execute_bounded
 
 from llm.instrumentation import generate_content
+from llm.llm_config import get_gemini_model
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "sql" / "wahadb.sqlite"
 
@@ -70,7 +71,10 @@ def make_sql_query(sql: str, args: dict[str, str]) -> list[tuple]:
     return execute_bounded(DB_PATH, sql, args).rows
 
 
-def sql_retrieve_fixed_funcs(query: str, *, client=None, on_llm_event=None, cancel_event=None) -> list[tuple] | None:
+def sql_retrieve_fixed_funcs(
+    query: str, *, client=None, model: str | None = None,
+    on_llm_event=None, cancel_event=None,
+) -> list[tuple] | None:
     """Select and execute a fixed query; return rows, or None if no tool fits."""
     if client is None:
         from llm.llm import llm_client
@@ -79,7 +83,7 @@ def sql_retrieve_fixed_funcs(query: str, *, client=None, on_llm_event=None, canc
 
     response = generate_content(
         client, purpose="sql.fixed_function", on_event=on_llm_event, cancel_event=cancel_event,
-        model="gemini-3.5-flash-lite",
+        model=get_gemini_model(model),
         contents=query,
         config={
             "system_instruction": FIXED_FUNC_SYSTEM_PROMPT,

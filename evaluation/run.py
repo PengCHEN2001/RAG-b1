@@ -29,11 +29,12 @@ from evaluation.metrics import (
     score_sql_case,
 )
 from evaluation.ragas_adapter import evaluate_ragas_cases
+from llm.llm_config import get_gemini_model, get_ragas_model
 
 
 ROOT = Path(__file__).resolve().parent.parent
 DATASET_CHOICES = ("all", "rulebook", "text2sql", "combined")
-DEFAULT_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_MODEL = get_gemini_model()
 DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
 
 
@@ -127,7 +128,10 @@ class AgentExecutor:
 
 
 def _score(
-    dataset: str, case: Mapping[str, Any], actual: Mapping[str, Any]
+    dataset: str,
+    case: Mapping[str, Any],
+    actual: Mapping[str, Any],
+    benchmarks: BenchmarkDatasets,
 ) -> tuple[dict[str, Any], bool]:
     route_correct = actual.get("route") == _expected_route(dataset, case)
     if dataset == "rulebook":
@@ -140,8 +144,56 @@ def _score(
             sql_result = {"status": status}
         score = score_sql_case(case, sql_result, latency_ms=actual.get("duration_ms"))
         return score, route_correct and bool(score["result_correct"])
-    both_sources = actual.get("sql_result") is not None and bool(actual.get("rulebook_results"))
-    return {"both_sources_returned": both_sources}, route_correct and both_sources
+    sql_cases = {item["case_id"]: item for item in benchmarks.text2sql}
+    rulebook_cases = {item["case_id"]: item for item in benchmarks.rulebook}
+
+    sql_result = actual.get("sql_result")
+    sql_scores = [
+        score_sql_case(sql_cases[case_id], sql_result or {"status": "not_called"})
+        for case_id in case["sql_reference_case_ids"]
+    ]
+    sql_correct = bool(sql_scores) and all(score["result_correct"] for score in sql_scores)
+
+    reference_contexts = [
+        context
+        for case_id in case["rulebook_reference_case_ids"]
+        for context in rulebook_cases[case_id]["reference_contexts"]
+    ]
+    rulebook_score = score_rulebook_case(
+        {"case_id": case["case_id"], "reference_contexts": reference_contexts},
+        actual.get("rulebook_results", []),
+    )
+    rulebook_correct = rulebook_score["recall_at_k"] == 1.0
+
+    required_sources = set(case["required_sources"])
+    retrievers_called = set(actual.get("retrievers_called", []))
+    citation_sources = set(actual.get("citation_sources", []))
+    calls_complete = required_sources.issubset(retrievers_called)
+    citations_complete = required_sources.issubset(citation_sources)
+    outcome_completed = actual.get("outcome") == "completed"
+
+    score = {
+        "route_correct": route_correct,
+        "retrievers_called": sorted(retrievers_called),
+        "required_retrievers_called": calls_complete,
+        "sql_reference_scores": sql_scores,
+        "sql_result_correct": sql_correct,
+        "rulebook_reference_score": rulebook_score,
+        "rulebook_contexts_correct": rulebook_correct,
+        "citation_sources": sorted(citation_sources),
+        "required_sources_cited": citations_complete,
+        "outcome_completed": outcome_completed,
+        "answer_review": "manual_required",
+    }
+    passed = all((
+        route_correct,
+        calls_complete,
+        sql_correct,
+        rulebook_correct,
+        citations_complete,
+        outcome_completed,
+    ))
+    return score, passed
 
 
 def _ragas_inputs(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -311,7 +363,7 @@ def run_evaluation(
             else:
                 try:
                     record["deterministic"], record["benchmark_passed"] = _score(
-                        dataset, case, actual
+                        dataset, case, actual, datasets
                     )
                 except Exception as error:
                     record["error_type"] = "evaluation_error"
@@ -351,8 +403,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=DATASET_CHOICES, default="all")
     parser.add_argument("--ragas", action="store_true")
-    parser.add_argument("--model", default=os.getenv("GEMINI_MODEL", DEFAULT_MODEL))
-    parser.add_argument("--judge-model", default=os.getenv("RAGAS_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--model", default=get_gemini_model())
+    parser.add_argument("--judge-model", default=get_ragas_model())
     parser.add_argument("--embedding-model", default=os.getenv("RAGAS_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL))
     parser.add_argument("--output-root", type=Path, default=ROOT / "evaluation")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d_%H%M%S"))

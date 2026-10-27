@@ -8,6 +8,7 @@ from pathlib import Path
 from time import perf_counter
 
 from llm.instrumentation import generate_content
+from llm.llm_config import get_gemini_model
 
 from .constraints import validate_entity_constraints
 from .entities import ENTITY_TABLES, resolve_entities, resolved_bindings, validate_entities
@@ -285,7 +286,7 @@ def retrieve_sql(
         *, 
         client=None, 
         db_path=None,
-        model: str = "gemini-3.5-flash-lite",
+        model: str | None = None,
         timing: bool = True,
         on_llm_event=None,
         cancel_event=None,
@@ -293,6 +294,7 @@ def retrieve_sql(
 
     """Retrieve bounded facts; set timing=False to suppress latency output."""
 
+    model = get_gemini_model(model)
     strategy = "none"
     started = perf_counter() if timing else 0.0
 
