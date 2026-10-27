@@ -234,9 +234,9 @@ question: str
        |
        +-- fixed / generated
              -> For fixed requests, normalize literal IDs into entity references
-             -> resolve_entities(): exact database lookup
+             -> resolve_entities(): normalized exact / phrase / spelling lookup
                   |
-                  +-- No match, multiple matches, or truncated candidates
+                  +-- No match, spelling suggestions, multiple matches, or truncated candidates
                   |     -> Return needs_clarification with candidates
                   |
                   +-- Unique matches, or no entities to resolve
@@ -251,7 +251,7 @@ question: str
                                       generation rules, and full data dictionary
                                    -> Return SQL + parameters, or stop with
                                       needs_clarification / unsupported
-                                   -> Check parameters and resolved-ID bindings
+                                   -> Check parameters and resolved identity bindings
 
 Executable SQL + parameters
   -> execute_bounded(): authorized, resource-bounded, read-only execution
@@ -272,11 +272,11 @@ The routing intent contains `mode`, `function`, `arguments`, `entities`, and `me
 }
 ```
 
-An entity declaration describes an object to look up. Its `key` is a request-local reference name, `kind` selects a lookup definition from `ENTITY_TABLES`, `match` is the string `"name"` or `"id"`, and `value` must appear in the original question. The model extracts these lookup descriptions; the application obtains the actual IDs from SQLite.
+An entity declaration describes an object to look up. Its `key` is a request-local reference name, `kind` selects a lookup definition from `ENTITY_TABLES`, `match` is the string `"name"` or `"id"`, and `value` must appear in the original question. Optional `faction_key`, `source_key`, and `unit_key` refer to context entity keys in the same request, without an `@` prefix. Abilities also accept an explicitly supplied `line` with `unit_key`. The model extracts these lookup descriptions; the application obtains the actual identities from SQLite.
 
-`validate_entities()` checks the declarations and their occurrence in the question. On the fixed path, `_normalize_fixed_references()` converts literal `d_id` or `faction_id` arguments into `@entity_key` references, adding ID-based entity declarations where necessary. This sends explicitly supplied IDs through the same database verification as names.
+`validate_entities()` checks the declarations, their occurrence in the question, and context references against the target kind and available foreign keys. On the fixed path, `_normalize_fixed_references()` converts literal `d_id` or `faction_id` arguments into `@entity_key` references, adding and validating ID-based entity declarations where necessary. This sends explicitly supplied IDs through the same database verification as names.
 
-`resolve_entities()` in `sql_retriever/entities.py` resolves factions first and uses a single resolved faction to narrow other lookups where a faction column exists. Names use trimmed, case-insensitive exact matching; IDs use exact string matching and retain leading zeros. When every lookup has a unique candidate, it returns a dictionary indexed by entity key:
+`resolve_entities()` in `sql_retriever/entities.py` resolves factions and sources first, then units before their abilities. Units support both faction and source constraints; abilities additionally support their owning unit. Other faction-linked entities support faction constraints. Explicit context references apply only to their referring entities. A single unreferenced context is shared; multiple unreferenced contexts of one applicable kind require clarification. All applicable filters intersect before name matching, including spelling suggestions. Names use Unicode NFKC, case folding, and whitespace normalization, followed by exact matching, complete-word phrase matching, and `difflib` spelling suggestions. Unique exact or phrase matches resolve automatically; spelling suggestions always require confirmation. IDs use exact string matching and retain leading zeros. It always returns an internal `EntityResolution` with `status`, `resolved`, `candidates`, `message`, and `truncated`. The `resolved` dictionary is indexed by entity key:
 
 ```json
 {
@@ -285,20 +285,35 @@ An entity declaration describes an object to look up. Its `key` is a request-loc
     "kind": "unit",
     "id": "000000001",
     "name": "Warboss",
-    "faction_id": "ORK"
+    "faction_id": "ORK",
+    "faction_name": "Orks",
+    "source_id": "000000046",
+    "source_name": "Orks",
+    "matched_text": "Warboss",
+    "match_type": "exact"
   }
 }
 ```
 
-Uniqueness is determined under the lookup table and applicable filters; an ID is not assumed to be globally unique. Missing or ambiguous matches, including truncated candidate lookups, return `RetrievalResult(status="needs_clarification")` and stop retrieval. An empty entity list produces an empty resolved dictionary and requires no lookup queries.
+Uniqueness is determined under the lookup table and applicable filters; an ID is not assumed to be globally unique. Missing, ambiguous, or spelling-only matches return an `EntityResolution` with `status="needs_clarification"`, retaining any identities already resolved. `hybrid.py` converts this into the public `RetrievalResult(status="needs_clarification")` and stops retrieval. Successful resolution uses `status="resolved"`; an empty entity list produces the same status with an empty resolved dictionary and requires no lookup queries.
 
-On the fixed path, `_fixed_query()` checks reference types, substitutes verified IDs, and validates the selected function's required and allowed arguments before calling its builder. A role filter must be explicitly supplied in the question. On the generated path, the second model call returns `mode`, `sql`, `parameters`, and `message`; only `mode="query"` proceeds to execution. The application checks that each resolved entity retains its exact `<entity_key>_id` parameter binding.
+Candidates include the available faction/source IDs and names, plus `matched_text` and `match_type` to explain the original mention and matching method. Card abilities also include their owning unit and line. Metadata uses left joins so missing optional catalog labels do not remove the entity.
 
-Both model stages receive the complete unchanged `data/sql/SQL_AGENT_DATA_DICTIONARY.md`. Generation rules take precedence over its examples and add semantic guidance, including card-specific ability overrides, distinct counts, cost configurations, and a guarded TEXT-to-integer template. These semantic rules guide the model; there is no separate live-schema or AST validation module.
+Ability lookup combines the `abilities` catalog with named `datasheets_abilities` rows. Under a unit or source constraint it also includes card rows that inherit their catalog name. A catalog ability keeps its verified `id`; a card ability uses the real `(DatasheetId, line)` identity as `unit_id` and `line`. Its optional `ability_id` is only a catalog link. Card names and descriptions override catalog values, and catalog joins require a matching faction or a shared core ability with an empty faction ID.
+
+Name catalogs are scanned without the business-query row cap, retaining the executor's byte, time, and VM budgets. An incomplete catalog requires narrower context instead of accepting a partial match. Exact and phrase candidates are capped at 200, spelling suggestions at five; omitted candidates set `truncated`. Spelling recall uses `get_close_matches` with a 0.6 cutoff, not a calibrated identity confidence. Catalogs are small enough for a per-lookup scan; no search service or additional dependency is required.
+
+On the fixed path, `_fixed_query()` checks reference types and substitutes verified IDs. Both this path and the legacy JSON selection parser call `build_fixed_query()` to validate model-supplied arguments once before invoking a trusted builder. A role filter must be explicitly supplied in the question. On the generated path, the second model call receives `required_bindings` and returns `mode`, `sql`, `parameters`, and `message`; only `mode="query"` proceeds to execution. The application checks exact parameter values: `<entity_key>_id` for catalog entities, an additional `<entity_key>_faction_id` for catalog abilities (empty for shared core rules), or `<entity_key>_unit_id` and `<entity_key>_line` for card abilities.
+
+`get_unit_model_stats(d_id)` handles one unit's characteristic lookup, including a single value such as Toughness. It returns every model profile with unit/model identity, movement, toughness, save, invulnerable save, wounds, leadership and objective control. Symbolic values remain strings. Cross-unit comparisons, rankings and numeric filters still use generation.
+
+`constraints.validate_entity_constraints()` uses SQLGlot's SQLite AST and scopes to verify effective identity filters in `WHERE` or inner-join `ON` predicates. It accepts direct key equalities and lists of resolved single-key IDs, inherits filters from required input CTEs/derived tables, and checks every set-operation branch. Compound card and catalog-ability identities must constrain the same table alias. Parameter mentions in projections, unused CTEs, scalar subqueries, or optional left-join conditions do not suffice. Unproven forms return `sql_policy`; resolved-entity queries do not accept right/full joins. See `docs/sql_entity_matching.md` for supported forms and limits.
+
+Both model stages receive the complete unchanged `data/sql/SQL_AGENT_DATA_DICTIONARY.md`. Generation rules take precedence over its examples and add semantic guidance, including card-specific ability overrides, distinct counts, cost configurations, and a guarded TEXT-to-integer template. AST validation covers resolved identity filters only; it does not prove general join, numeric, projection, or natural-language semantics. There is no separate live-schema validator.
 
 Fixed queries, generated queries, and entity lookups all use `execute_bounded()` in `sql_retriever/safety.py`. It validates input boundaries, opens a read-only connection, applies business-table and function authorization, executes one statement, and enforces execution and result budgets. It returns `columns`, `rows`, and `truncated`. The outer retriever adds the executed SQL, parameters, strategy, and status: non-empty or truncated results are `ok`; an empty, untruncated result is `empty`. Expected validation, model, and execution failures become `error` results with an `error_code`. Natural-language answer generation belongs to the downstream answer layer.
 
-Only a generated query's syntax or name-resolution failure permits one model repair with bounded compilation diagnostics. Empty results, permission denials, parameter errors, and execution-budget failures do not retry. A failed fixed request does not automatically switch to generation. Fixed requests normally use one model call; generated requests use two, or three when a repair is attempted.
+Only a generated query's syntax or name-resolution failure permits one model repair with the failed SQL, its parameters, and bounded compilation diagnostics. Repair retains the original question and resolved identities and never receives database result rows. Corrected SQL undergoes the same identity and execution checks. Empty results, identity-policy failures, permission denials, parameter errors, and execution-budget failures do not retry. A failed fixed request does not automatically switch to generation. Fixed requests normally use one model call; generated requests use two, or three when a repair is attempted.
 
 
 ## Agent Graphs and Conversation Replies
@@ -307,7 +322,9 @@ Only a generated query's syntax or name-resolution failure permits one model rep
 
 - Callers supply the new `user_input` and `run_id`. `prepare_turn` increments the turn index, clears previous working results, and preserves conversation context and pending clarification. It keeps up to eight committed turns within an approximate 5,000-token history budget, using LangGraph's `Overwrite` to replace the message window.
 - `plan` makes one structured Google GenAI call to resolve conversational references, choose a source route, and plan source-specific questions. For rulebook routes, it constructs the existing `RulebookQuerySet` and copies the original input directly. The two `both` modes are distinguished by `depends_on_sql`.
+- For a pure `sql` route, the application passes `standalone_question` directly to SQL retrieval instead of using a second model-authored query. For `both`, `sql_question` remains the natural-language database subquestion. Planning receives no data dictionary and must preserve supplied names and avoid generating SQL; the SQL retriever owns schema interpretation and receives the dictionary in routing and generation.
 - Planning receives history, explicit conversation conditions, and actual pending candidates. The model reports when a new topic should clear old conditions and pending clarification. It does not append an assistant message or run either retriever.
+- Clarification replies also receive the actual pending candidates, including their kinds; the application still appends the exact numbered candidate list.
 - Inject a GenAI-compatible `client` for testing; the default client is loaded lazily from `llm.llm`. Pydantic validates the response and route/query consistency. Invalid output and provider errors propagate without automatic retries or alternative retrieval.
 
 `agent/graph.py` provides `build_agent_graph()` for complete turns: evidence collection → `respond` → `finalize`. `build_evidence_graph()` retains the evidence-only entry point for retrieval inspection and evaluation.
