@@ -77,6 +77,16 @@ The parser also provides a LangChain page adapter. Missing files and incomplete 
 
 The processed files are saved in `data/processed/`: `Core Rules.json`, `Core Rules.md`, PNG images, and `images/Core Rules/manifest.json`. The current conversion processed 60 pages and exported 148 images.
 
+### Documented visual-text correction
+
+The project currently follows a text-first RAG strategy. Extracted images and their page references are retained for provenance, but full PDF page images are not sent to Gemini at query time. This avoids the additional image-input tokens, latency, and implementation complexity of multimodal generation.
+
+For a verified visual element that directly affects the meaning of a rule, the project uses a scoped visual-to-text normalisation. On page 42, the Grenade Stratagem displays its `1CP` cost in a graphical label beside the rule block. Docling extracted the main rule text but did not preserve the spatial relation between that label and the Grenade section, so the production chunk represents the visible label as `COST: 1CP` before indexing.
+
+This source-backed correction is recorded in `data/processed/Core Rules.corrections.json`. The chunker automatically loads a correction file with the same stem as its input JSON, validates the target chunk and PDF page, and then applies the documented text insertion. The correction restores information visible on PDF page 42; it does not add a rule that is absent from the source or modify evaluation references only.
+
+The benchmark verifies that this searchable text representation supports the expected answer. This demonstrates the feasibility of selective visual-to-text normalisation, but it is not presented as a general image-understanding solution. A future layout-aware extractor could associate all Stratagem cost icons automatically.
+
 ## Chunking Design
 
 Implemented in `ingestion/chunker.py`.
@@ -87,6 +97,7 @@ Implemented in `ingestion/chunker.py`.
 - Exclude page headers, footers, and empty elements. Pictures are not embedded as text; their IDs, paths, and pages remain attached as metadata.
 - Use document-aware recursive splitting only when a logical unit is too long: target 300–400 BGE tokens, maximum 450 tokens, split at paragraph or sentence boundaries, with a 60-token overlap only between parts of the same long unit.
 - Output: `data/processed/Core Rules.chunks.jsonl`. The current rulebook produces 212 chunks.
+- If `<input stem>.corrections.json` exists, apply and validate those documented visual-to-text corrections before writing the final chunk file.
 
 Each chunk stores:
 

@@ -1,9 +1,11 @@
 """Small unit tests for document-aware chunk construction."""
 
+import json
 import re
 import unittest
+from pathlib import Path
 
-from ingestion.chunker import PictureLink, chunk_document
+from ingestion.chunker import PictureLink, apply_corrections, chunk_document, load_corrections
 
 
 def count_words(text: str) -> int:
@@ -11,6 +13,51 @@ def count_words(text: str) -> int:
 
 
 class ChunkerTests(unittest.TestCase):
+    def test_applies_source_backed_visual_text_correction(self):
+        chunks = [{
+            "chunk_id": "core-rules-grenade-001-001",
+            "text": "GRENADE\n\nCORE - WARGEAR STRATAGEM\n\nWHEN: Your Shooting phase.",
+            "pdf_page_numbers": [42],
+            "token_count": 8,
+        }]
+        correction = {
+            "correction_id": "core-rules-page-42-grenade-cost",
+            "chunk_id": "core-rules-grenade-001-001",
+            "pdf_page_number": 42,
+            "operation": "insert_after",
+            "anchor": "CORE - WARGEAR STRATAGEM",
+            "text": "COST: 1CP",
+            "source_evidence": "Visible label on PDF page 42.",
+            "reason": "The layout association was lost during parsing.",
+        }
+
+        corrected = apply_corrections(chunks, [correction], count_tokens=count_words)
+        self.assertIn("CORE - WARGEAR STRATAGEM\n\nCOST: 1CP", corrected[0]["text"])
+        self.assertEqual(corrected[0]["token_count"], count_words(corrected[0]["text"]))
+        self.assertEqual(
+            apply_corrections(corrected, [correction], count_tokens=count_words),
+            corrected,
+        )
+
+    def test_project_correction_matches_canonical_grenade_chunk(self):
+        root = Path(__file__).resolve().parents[1]
+        corrections = load_corrections(root / "data/processed/Core Rules.corrections.json")
+        chunks = [
+            json.loads(line)
+            for line in (root / "data/processed/Core Rules.chunks.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        grenade = next(
+            chunk for chunk in chunks
+            if chunk["chunk_id"] == "core-rules-grenade-001-001"
+        )
+
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(corrections[0]["pdf_page_number"], 42)
+        self.assertIn(corrections[0]["text"], grenade["text"])
+
     def test_keeps_section_context_and_filters_page_furniture(self):
         document = {
             "body": {"children": [

@@ -70,6 +70,73 @@ def load_picture_manifest(path: Path | None) -> dict[str, PictureLink]:
     return result
 
 
+def load_corrections(path: Path | None) -> list[dict[str, Any]]:
+    """Load optional, source-backed text corrections for known layout losses."""
+    if path is None or not path.is_file():
+        return []
+    with path.open(encoding="utf-8") as file:
+        records = json.load(file)
+    if not isinstance(records, list):
+        raise ValueError("Chunk corrections must be stored as a JSON list.")
+    required = {
+        "correction_id", "chunk_id", "pdf_page_number", "operation",
+        "anchor", "text", "source_evidence", "reason",
+    }
+    identifiers: set[str] = set()
+    for record in records:
+        missing = required - set(record)
+        if missing:
+            raise ValueError(f"Chunk correction is missing fields: {sorted(missing)}")
+        identifier = record["correction_id"]
+        if identifier in identifiers:
+            raise ValueError(f"Duplicate chunk correction ID: {identifier}")
+        identifiers.add(identifier)
+    return records
+
+
+def apply_corrections(
+    chunks: list[dict[str, Any]],
+    corrections: Iterable[dict[str, Any]],
+    *,
+    count_tokens: Callable[[str], int],
+) -> list[dict[str, Any]]:
+    """Apply explicit visual-to-text corrections and validate their provenance.
+
+    Corrections live outside benchmark data and are applied to production chunks
+    before indexing.  The operation is idempotent so a previously corrected
+    chunk is not modified a second time.
+    """
+    chunks_by_id = {chunk["chunk_id"]: chunk for chunk in chunks}
+    for correction in corrections:
+        chunk_id = correction["chunk_id"]
+        chunk = chunks_by_id.get(chunk_id)
+        if chunk is None:
+            raise ValueError(
+                f"Correction {correction['correction_id']} targets missing chunk {chunk_id}."
+            )
+        page = correction["pdf_page_number"]
+        if page not in chunk.get("pdf_page_numbers", []):
+            raise ValueError(
+                f"Correction {correction['correction_id']} expects PDF page {page}, "
+                f"but {chunk_id} has pages {chunk.get('pdf_page_numbers', [])}."
+            )
+        if correction["operation"] != "insert_after":
+            raise ValueError(f"Unsupported correction operation: {correction['operation']}")
+
+        text = correction["text"]
+        if text in chunk["text"]:
+            continue
+        anchor = correction["anchor"]
+        if chunk["text"].count(anchor) != 1:
+            raise ValueError(
+                f"Correction {correction['correction_id']} requires one anchor "
+                f"{anchor!r} in {chunk_id}."
+            )
+        chunk["text"] = chunk["text"].replace(anchor, f"{anchor}\n\n{text}", 1)
+        chunk["token_count"] = count_tokens(chunk["text"])
+    return chunks
+
+
 def _reference_index(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Index all Docling nodes by their JSON pointer-like ``self_ref``."""
     index: dict[str, dict[str, Any]] = {}
@@ -447,6 +514,10 @@ def main() -> None:
     parser.add_argument("input", type=Path, help="Docling JSON export")
     parser.add_argument("--source", default="data/pdf/Core Rules.pdf")
     parser.add_argument("--manifest", type=Path, help="Picture manifest JSON")
+    parser.add_argument(
+        "--corrections", type=Path,
+        help="Optional JSON corrections (defaults to <input stem>.corrections.json when present)",
+    )
     parser.add_argument("--output", type=Path, default=Path("data/processed/Core Rules.chunks.jsonl"))
     parser.add_argument("--tokenizer-model", default=DEFAULT_TOKENIZER_MODEL)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
@@ -455,10 +526,16 @@ def main() -> None:
 
     document = load_document(args.input)
     manifest = args.manifest or args.input.parent / "images" / args.input.stem / "manifest.json"
+    corrections_path = args.corrections or args.input.with_suffix(".corrections.json")
+    count_tokens = _bge_token_counter(args.tokenizer_model)
     chunks = chunk_document(
         document, source=args.source, pictures=load_picture_manifest(manifest),
-        count_tokens=_bge_token_counter(args.tokenizer_model),
+        count_tokens=count_tokens,
         max_tokens=args.max_tokens, overlap_tokens=args.overlap_tokens,
+    )
+    chunks = apply_corrections(
+        chunks, load_corrections(corrections_path),
+        count_tokens=count_tokens,
     )
     count = write_jsonl(chunks, args.output)
     digest = sha256(args.output.read_bytes()).hexdigest()[:12]
