@@ -6,10 +6,12 @@ import os
 import platform
 import traceback
 from contextlib import closing
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
+from queue import Empty, SimpleQueue
+from threading import Event
 from time import perf_counter
 from uuid import uuid4
 
@@ -17,6 +19,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.types import Overwrite
 from pydantic import ValidationError
 
+from llm.instrumentation import summarize_usage
 from retrieval.rulebook_retriever import RetrievedChunk, RetrievedRulebookContext, RulebookQuerySet
 from sql_retriever import RetrievalResult
 
@@ -88,7 +91,8 @@ class _TraceFile:
                     "uv_lock_sha256": hashlib.sha256((ROOT / "uv.lock").read_bytes()).hexdigest(),
                     "code_sha256": _code_fingerprint(), "code_snapshot": None, "data_versions": None,
                     "trace_scope": "graph", "llm_requests": None,
-                    "retriever_internals": None, "token_usage": None,
+                    "retriever_internals": None, "token_usage": "provider",
+                    "llm_call_scope": "sdk_invocations",
                 }, ensure_ascii=False, indent=2), encoding="utf-8")
             self.file = self.path.open("x", encoding="utf-8")
         except OSError as error:
@@ -156,8 +160,13 @@ def run_turn(graph, context, *, session_id, question, trace_dir=DEFAULT_TRACE_DI
     prepared = False
     state = previous
     outcome = "error"
+    llm_queue = SimpleQueue()
+    calls, node_spans = {}, {}
+    instrumentation_complete = True
+    turn_cancel = cancel_event if cancel_event is not None else Event()
+    turn_context = replace(context, on_llm_event=llm_queue.put, cancel_event=turn_cancel)
 
-    def emit(event, payload, *, node=None, span_id=None):
+    def emit(event, payload, *, node=None, span_id=None, parent_span_id=None):
         nonlocal seq, warned
         seq += 1
         secrets = [os.getenv("GOOGLE_API_KEY"), getattr(context.client, "api_key", None)]
@@ -166,7 +175,7 @@ def run_turn(graph, context, *, session_id, question, trace_dir=DEFAULT_TRACE_DI
         record = trace_value({
             "schema_version": 1, "session_id": session_id, "run_id": run_id,
             "seq": seq, "timestamp": _now(), "event": event, "node": node,
-            "span_id": span_id or run_id, "parent_span_id": run_id if span_id else None,
+            "span_id": span_id or run_id, "parent_span_id": parent_span_id or (run_id if span_id else None),
             "payload": payload,
         }, [secret for secret in secrets if isinstance(secret, str) and secret])
         writer.write(record)
@@ -176,24 +185,49 @@ def run_turn(graph, context, *, session_id, question, trace_dir=DEFAULT_TRACE_DI
             warned = True
             emit("trace.failed", {"error_type": writer.failure, "message": "Trace is incomplete; interaction can continue."})
 
+    def drain_llm_events():
+        # Node threads only enqueue. This runner owns numbering, aggregation and
+        # disk writes, including events left behind when the stream is cancelled.
+        while True:
+            try:
+                event = llm_queue.get_nowait()
+            except Empty:
+                break
+            payload = event["payload"]
+            calls[payload["call_id"]] = payload
+            emit(event["event"], payload, node=event["node"], span_id=payload["call_id"],
+                 parent_span_id=node_spans[event["node"]])
+
     emit("run.started", {
         "user_input": question, "turn_index": previous.get("turn_index", 0) + 1,
         "model": context.model, "previous_messages": previous.get("messages", []),
         "conversation_context": previous.get("conversation_context", {}),
         "pending_clarification": previous.get("pending_clarification"),
-        "trace_enabled": trace_dir is not None, "llm_calls": None, "usage": None,
+        "trace_enabled": trace_dir is not None, "llm_calls": 0, "usage": summarize_usage([]),
+        "llm_call_scope": "sdk_invocations",
     })
     try:
         if cancel_event is not None and cancel_event.is_set():
             raise KeyboardInterrupt
         with closing(graph.stream({"user_input": question, "run_id": run_id}, config,
-                                  context=context, stream_mode="tasks")) as stream:
-            for task in stream:
+                                  context=turn_context, stream_mode=["tasks", "custom"])) as stream:
+            for mode, task in stream:
+                if mode == "custom":
+                    drain_llm_events()
+                    continue
                 task_id, node = task["id"], task["name"]
                 if "input" in task:
+                    node_spans[node] = task_id
                     active[task_id] = (node, perf_counter())
-                    emit("step.started", {"input": task["input"]}, node=node, span_id=task_id)
+                    if node == "retrieve_sql" and context.sql_retriever is not None:
+                        # The question-only injected callable is an opaque boundary.
+                        instrumentation_complete = False
+                    emit("step.started", {"input": task["input"],
+                                          "llm_instrumentation_complete": instrumentation_complete},
+                         node=node, span_id=task_id)
+                    drain_llm_events()
                 else:
+                    drain_llm_events()
                     _, step_started = active.pop(task_id)
                     duration = (perf_counter() - step_started) * 1000
                     durations[node] = duration
@@ -225,6 +259,7 @@ def run_turn(graph, context, *, session_id, question, trace_dir=DEFAULT_TRACE_DI
         state = graph.get_state(config).values
         outcome = state["outcome"]
     except (Exception, KeyboardInterrupt) as failure:
+        drain_llm_events()
         outcome = "cancelled" if isinstance(failure, KeyboardInterrupt) else "error"
         error = _exception_info(failure)
         for task_id, (node, step_started) in active.items():
@@ -237,13 +272,17 @@ def run_turn(graph, context, *, session_id, question, trace_dir=DEFAULT_TRACE_DI
         if not prepared:
             state.update(route_plan=None, sql_result=None, rulebook_result=None)
     finally:
+        drain_llm_events()
+        context.rulebook_retriever = turn_context.rulebook_retriever
+        usage = summarize_usage((call["usage"] for call in calls.values()),
+                                instrumentation_complete=instrumentation_complete)
         duration = (perf_counter() - started) * 1000
         # finish is emitted only here, including graph errors and Ctrl-C. A killed
         # process may leave only a prefix; the offline reader calls it interrupted.
         emit("run.finished", {
             "outcome": outcome, "duration_ms": duration, "step_durations_ms": durations,
             "failed_node": failed_node, "error": error, "state": state,
-            "llm_calls": None, "usage": None, "first_answer_token_ms": None,
+            "llm_calls": len(calls), "usage": usage, "first_answer_token_ms": None,
         })
         writer.close()
         if writer.failure is not None and not warned:
@@ -252,6 +291,7 @@ def run_turn(graph, context, *, session_id, question, trace_dir=DEFAULT_TRACE_DI
         "session_id": session_id, "run_id": run_id, "state": state, "outcome": outcome,
         "duration_ms": duration, "step_durations_ms": durations, "error": error,
         "failed_node": failed_node, "trace_path": writer.path, "trace_complete": writer.complete,
+        "llm_calls": len(calls), "usage": usage,
     }
 
 

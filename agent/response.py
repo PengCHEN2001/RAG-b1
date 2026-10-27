@@ -9,6 +9,7 @@ from langgraph.graph.message import add_messages
 from langgraph.types import Overwrite
 from pydantic import BaseModel, ConfigDict, Field
 
+from llm.instrumentation import generate_content
 from sql_retriever.result import RetrievalResult
 
 from .nodes import DEFAULT_MODEL, NonEmptyText, _trim_history
@@ -149,7 +150,8 @@ def _answer_evidence(state: AgentState):
     return sources, citations, clipped
 
 
-def respond(state: AgentState, *, client=None, model: str = DEFAULT_MODEL) -> dict[str, object]:
+def respond(state: AgentState, *, client=None, model: str = DEFAULT_MODEL,
+            on_llm_event=None, cancel_event=None) -> dict[str, object]:
     """One structured model call; validate provenance before publishing a reply."""
     if client is None:
         from llm.llm import llm_client
@@ -163,7 +165,8 @@ def respond(state: AgentState, *, client=None, model: str = DEFAULT_MODEL) -> di
     sql_memory = _sql_memory(state["sql_result"])
     sql = state["sql_result"]
     pending = state.get("pending_clarification")
-    response = client.models.generate_content(
+    response = generate_content(
+        client, purpose="respond", on_event=on_llm_event, cancel_event=cancel_event,
         model=model,
         contents=json.dumps({
             "question": state["user_input"],

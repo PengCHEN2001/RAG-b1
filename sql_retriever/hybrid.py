@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from time import perf_counter
 
+from llm.instrumentation import generate_content
+
 from .entities import ENTITY_TABLES, resolve_entities, validate_entities
 from .fixed_func import DB_PATH, parse_function_call
 from .functions import FUNCTION_REGISTRY, get_function_declarations
@@ -128,9 +130,11 @@ def _timed_phase(phase: str, enabled: bool = True):
         print(f"[hybrid] {phase}: {elapsed_ms:.2f} ms", file=sys.stderr, flush=True)
 
 
-def _model_json(client, model: str, prompt: str, content: dict, schema: dict) -> dict:
+def _model_json(client, model: str, prompt: str, content: dict, schema: dict, *,
+                purpose, on_llm_event=None, cancel_event=None) -> dict:
     try:
-        response = client.models.generate_content(
+        response = generate_content(
+            client, purpose=purpose, on_event=on_llm_event, cancel_event=cancel_event,
             model=model, 
             contents=json.dumps(content, ensure_ascii=False), 
             config={
@@ -245,6 +249,8 @@ def retrieve_sql(
         db_path=None,
         model: str = "gemini-3.5-flash-lite",
         timing: bool = True,
+        on_llm_event=None,
+        cancel_event=None,
     ) -> RetrievalResult:
 
     """Retrieve bounded facts; set timing=False to suppress latency output."""
@@ -282,7 +288,7 @@ def retrieve_sql(
                 client, model,
                 ROUTING_PROMPT + reference,
                 {"question": question},
-                INTENT_SCHEMA
+                INTENT_SCHEMA, purpose="sql.route", on_llm_event=on_llm_event, cancel_event=cancel_event,
             )
 
         if not isinstance(intent["arguments"], dict):
@@ -322,7 +328,11 @@ def retrieve_sql(
             prompt = GENERATION_PROMPT + reference
             for attempt in range(2):
                 with _timed_phase("SQL generation" if attempt == 0 else "SQL repair", timing):
-                    generation = _model_json(client, model, prompt, content, GENERATION_SCHEMA)
+                    generation = _model_json(
+                        client, model, prompt, content, GENERATION_SCHEMA,
+                        purpose="sql.generate" if attempt == 0 else "sql.repair",
+                        on_llm_event=on_llm_event, cancel_event=cancel_event,
+                    )
                 parameters = validate_parameters(generation["parameters"])
                 if generation["mode"] != "query":
                     if generation["sql"] is not None or parameters:

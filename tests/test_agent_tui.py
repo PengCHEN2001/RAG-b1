@@ -12,11 +12,13 @@ from textual.widgets import Button, DataTable, Input, Select, Static, TabbedCont
 
 from agent import EvidenceContext, build_agent_graph
 from agent.runtime import read_trace, run_turn
+from llm.instrumentation import session_stats
 from sql_retriever import RetrievalResult
 from test_agent_graph import rulebook_stub
 from test_agent_nodes import planning_output
 from test_agent_response import response_output
 from test_sql_hybrid import client_for
+from test_llm_usage import usage_response
 from ui.tui import RAGApp, main
 
 
@@ -151,7 +153,7 @@ class AgentTUITests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(70, 24)) as pilot:
             self.assertEqual(app.stage, "completed")
             self.assertTrue(app.query_one("#question", Input).disabled)
-            self.assertEqual(app.query_one("#timeline", DataTable).row_count, 7)
+            self.assertEqual(app.query_one("#timeline", DataTable).row_count, 9)
             await pilot.press("ctrl+s")
             self.assertTrue(app.query_one("#inspector").display)
             self.assertIn("S1", json.loads(app.query_one("#source-json", TextArea).text))
@@ -163,6 +165,40 @@ class AgentTUITests(unittest.IsolatedAsyncioTestCase):
         with patch("ui.tui.build_agent_graph") as build, patch.object(RAGApp, "run"):
             main(["--inspect", str(result["trace_path"])])
             build.assert_not_called()
+
+    async def test_usage_totals_are_live_deduplicated_on_replay_and_unknown_for_legacy(self):
+        self.context.client = client_for({})
+        self.context.client.models.generate_content.side_effect = [
+            usage_response(output) for output in (
+                planning_output("rulebook"), response_output("规则。[R1]"),
+                planning_output("rulebook"), response_output("追问。[R1]"),
+            )
+        ]
+        app = RAGApp(graph=self.graph, context=self.context, trace_dir=self.root)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self.ask(app, pilot, "First")
+            first_id, first_path = app.run_id, app.selected_path
+            self.assertEqual(app.stats["llm_calls"], 2)
+            self.assertEqual(app.stats["usage"]["total_token_count"], 234)
+            self.assertIn("total=234", str(app.query_one("#metadata", Static).render()))
+            await self.ask(app, pilot, "Followup")
+            app.query_one("#runs", Select).value = first_id
+            await pilot.pause()
+            self.assertEqual(session_stats(app.session_runs.values())["llm_calls"], 4)
+            self.assertEqual(session_stats(app.session_runs.values())["usage"]["total_token_count"], 468)
+            self.assertEqual(app.stats["usage"]["total_token_count"], 234)
+            app.action_new_session()
+            self.assertEqual(app.session_runs, {})
+        legacy = read_trace(first_path)
+        legacy["events"] = [e for e in legacy["events"] if not e["event"].startswith("llm.")]
+        for event in legacy["events"]:
+            if event["event"] in ("run.started", "run.finished"):
+                event["payload"].update(llm_calls=None, usage=None)
+        app = RAGApp(inspect_path=first_path, trace=legacy)
+        async with app.run_test() as pilot:
+            self.assertIsNone(app.stats["llm_calls"])
+            self.assertIsNone(app.stats["usage"])
+            self.assertIn("usage unavailable", str(app.query_one("#metadata", Static).render()))
 
     async def test_quit_waits_for_active_call_and_unexpected_runner_errors_unlock_input(self):
         entered, release = Event(), Event()

@@ -3,14 +3,17 @@
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from threading import Event
 from typing import Any
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, ConfigDict
 
+from llm.instrumentation import generate_content
 from retrieval.rulebook_retriever import (
     RetrievedChunk,
     RetrievedRulebookContext,
@@ -48,6 +51,8 @@ class EvidenceContext:
     model: str = DEFAULT_MODEL
     rulebook_retriever: RulebookRetriever | None = None
     sql_retriever: Callable[[str], RetrievalResult] | None = None
+    on_llm_event: Callable[[dict], None] | None = None
+    cancel_event: Event | None = None
 
 
 class _QueryRefinement(BaseModel):
@@ -84,8 +89,24 @@ class _EvidenceSerializer(JsonPlusSerializer):
         return _restore_tuples(super().loads_typed(data))
 
 
+def _llm_events(context, node):
+    writer = get_stream_writer()
+
+    def emit(event):
+        record = {**event, "node": node}
+        # The runner's queue retains terminal usage even if cancellation closes
+        # the graph stream before it can deliver its remaining custom events.
+        if context.on_llm_event is not None:
+            context.on_llm_event(record)
+        writer(record)
+
+    return emit
+
+
 def _plan(state: AgentState, runtime: Runtime[EvidenceContext]):
-    return plan(state, client=runtime.context.client, model=runtime.context.model)
+    context = runtime.context
+    return plan(state, client=context.client, model=context.model,
+                on_llm_event=_llm_events(context, "plan"), cancel_event=context.cancel_event)
 
 
 def retrieve_sql_node(state: AgentState, runtime: Runtime[EvidenceContext]):
@@ -93,7 +114,8 @@ def retrieve_sql_node(state: AgentState, runtime: Runtime[EvidenceContext]):
     question = state["route_plan"]["sql_question"]
     result = (
         context.sql_retriever(question) if context.sql_retriever is not None
-        else retrieve_sql(question, client=context.client, model=context.model, timing=False)
+        else retrieve_sql(question, client=context.client, model=context.model, timing=False,
+                          on_llm_event=_llm_events(context, "retrieve_sql"), cancel_event=context.cancel_event)
     )
     return {"sql_result": result}
 
@@ -125,7 +147,9 @@ def prepare_rulebook_query(state: AgentState, runtime: Runtime[EvidenceContext])
 
         client = llm_client
     query_set = state["route_plan"]["rulebook_query_set"]
-    response = client.models.generate_content(
+    response = generate_content(
+        client, purpose="prepare_rulebook_query", on_event=_llm_events(context, "prepare_rulebook_query"),
+        cancel_event=context.cancel_event,
         model=context.model,
         contents=json.dumps({
             "question": state["standalone_question"],
@@ -250,7 +274,9 @@ def build_evidence_graph():
 
 
 def _respond(state: AgentState, runtime: Runtime[EvidenceContext]):
-    return respond(state, client=runtime.context.client, model=runtime.context.model)
+    context = runtime.context
+    return respond(state, client=context.client, model=context.model,
+                   on_llm_event=_llm_events(context, "respond"), cancel_event=context.cancel_event)
 
 
 def build_agent_graph():

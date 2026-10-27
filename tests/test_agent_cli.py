@@ -69,8 +69,9 @@ class AgentCLITests(unittest.TestCase):
         terminal = received[-1]["payload"]
         self.assertEqual(terminal["state"]["sql_result"]["parameters"], {"id": "000000001"})
         self.assertEqual(terminal["state"]["rulebook_result"]["results"][0]["chunk"]["pdf_page_numbers"], [7])
-        self.assertIsNone(terminal["usage"])
-        self.assertIsNone(terminal["llm_calls"])
+        self.assertIsNone(terminal["usage"]["total_token_count"])
+        self.assertFalse(terminal["usage"]["complete"])
+        self.assertEqual(terminal["llm_calls"], 3)
         metadata = json.loads((result["trace_path"].parent / "session.json").read_text())
         self.assertEqual(metadata["trace_scope"], "graph")
         self.assertIsNone(metadata["retriever_internals"])
@@ -180,6 +181,8 @@ class AgentCLITests(unittest.TestCase):
         self.assertIn('"pdf_page_numbers"', stdout)
         self.assertIn("… plan", stderr)
         self.assertIn("route=both", stderr)
+        self.assertIn("LLM calls=2", stderr)
+        self.assertIn("total=null", stderr)
         self.assertIn("outcome=completed", stderr)
         self.assertEqual(len(list(self.root.glob("*/*.jsonl"))), 1)
 
@@ -203,6 +206,8 @@ class AgentCLITests(unittest.TestCase):
         self.assertIn('"query_id"', stdout)
         self.assertIn("{}", stdout)
         self.assertIn("New session:", stderr)
+        self.assertIn("Session LLM calls=4", stderr)
+        self.assertEqual(stderr.count("Session LLM calls=2"), 2)
         calls = self.context.client.models.generate_content.call_args_list
         self.assertEqual(len(json.loads(calls[2].kwargs["contents"])["history"]), 2)
         self.assertEqual(json.loads(calls[4].kwargs["contents"])["history"], [])

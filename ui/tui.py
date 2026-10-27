@@ -22,6 +22,7 @@ from textual.worker import Worker, WorkerState
 from agent import EvidenceContext, build_agent_graph
 from agent.nodes import DEFAULT_MODEL
 from agent.runtime import DEFAULT_TRACE_DIR, read_trace, run_turn, source_details
+from llm.instrumentation import format_usage, session_stats, summarize_usage
 
 
 class TraceEvent(Message):
@@ -93,6 +94,10 @@ class RAGApp(App):
         # Keep only one full run in memory. Older runs are loaded from their
         # trace on selection; the chat log has a bounded rendering buffer.
         self.runs = {}
+        self.session_runs = {}
+        self.calls = {}
+        self.stats = {"llm_calls": None, "usage": None}
+        self.instrumentation_complete = True
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -206,13 +211,26 @@ class RAGApp(App):
             self.run_id = event["run_id"]
             self.state = {"user_input": payload["user_input"], "turn_index": payload["turn_index"]}
             self.trace_status = "recording" if payload["trace_enabled"] else "off"
+            self.stats = {"llm_calls": payload.get("llm_calls"), "usage": payload.get("usage")}
         elif kind == "step.started":
             self.stage = event["node"]
             table.add_row(event["node"], "running", "—", key=event["span_id"])
+            if not payload.get("llm_instrumentation_complete", True):
+                self.instrumentation_complete = False
+                self.update_llm_stats()
         elif kind in ("step.finished", "step.failed"):
             key = event["span_id"]
             table.update_cell(key, "Status", "done" if kind == "step.finished" else "failed")
             table.update_cell(key, "ms", f"{payload['duration_ms']:.1f}")
+        elif kind.startswith("llm."):
+            self.calls[payload["call_id"]] = payload
+            key = event["span_id"]
+            if kind == "llm.started":
+                table.add_row(f"↳ {payload['purpose']}", "running", "—", key=key)
+            else:
+                table.update_cell(key, "Status", "returned" if kind == "llm.finished" else "failed")
+                table.update_cell(key, "ms", f"{payload['duration_ms']:.1f}")
+            self.update_llm_stats()
         elif kind in ("route.selected", "query.refined"):
             self.plan = payload["route_plan"]
             self.state.update(payload)
@@ -222,11 +240,19 @@ class RAGApp(App):
             self.terminal = payload
             self.state = payload["state"]
             self.stage = payload["outcome"]
+            self.stats = {"llm_calls": payload.get("llm_calls"), "usage": payload.get("usage")}
+            self.session_runs[event["run_id"]] = self.stats
             table.add_row("run.finished", self.stage, f"{payload['duration_ms']:.1f}", key=event["run_id"])
         elif kind == "trace.failed":
             self.trace_status = "INCOMPLETE"
             self.query_one("#notice", Static).update(f"Trace incomplete: {payload['error_type']}. Interaction can continue.")
         self.update_metadata()
+
+    def update_llm_stats(self):
+        self.stats = {"llm_calls": len(self.calls), "usage": summarize_usage(
+            (call["usage"] for call in self.calls.values()),
+            instrumentation_complete=self.instrumentation_complete,
+        )}
 
     def update_metadata(self):
         first = self.events[0] if self.events else None
@@ -242,12 +268,14 @@ class RAGApp(App):
         failed = self.terminal and self.terminal.get("error")
         status = f"{self.stage} @ {self.terminal['failed_node'] or 'runtime'}" if failed else self.stage
         clipped = sql.get("truncated") or self.state.get("sql_context_truncated") or any(self.state.get("answer_context_truncated", {}).values())
+        totals = session_stats({**self.session_runs, self.run_id: self.stats}.values())
         lines = [
             f"Session {first['session_id'][:8]} · run {first['run_id'][:8]} · turn {first['payload']['turn_index']}",
-            f"Model {first['payload']['model']}",
             f"Route {route} · {status} · {total}",
-            f"SQL {sql.get('strategy', '—')} · rows {sql.get('count', '—')} · chunks {rules.get('count', '—')}" + (" · clipped" if clipped else ""),
-            f"Trace {self.trace_status} · usage unavailable · history {len(first['payload']['previous_messages'])} messages",
+            f"LLM {self.stats['llm_calls']} · {format_usage(self.stats['usage'])}",
+            f"Session LLM {totals['llm_calls']} · {format_usage(totals['usage'])}",
+            f"SQL {sql.get('strategy', '—')} · rows {sql.get('count', '—')} · chunks {rules.get('count', '—')} · trace {self.trace_status}" + (" · clipped" if clipped else ""),
+            f"Model {first['payload']['model']} · history {len(first['payload']['previous_messages'])} messages",
         ]
         if plan.get("reason"):
             lines.append(plan["reason"])
@@ -305,6 +333,9 @@ class RAGApp(App):
         self.run_id, self.terminal, self.selected_path = None, None, None
         self.inspected_span, self.source_ref = None, ""
         self.events, self.state, self.plan, self.retrievals = [], {}, {}, {}
+        self.calls = {}
+        self.stats = {"llm_calls": None, "usage": None}
+        self.instrumentation_complete = True
         self.query_one("#timeline", DataTable).clear()
         self.query_one("#source-json", TextArea).load_text("")
         self.query_one("#payload-json", TextArea).load_text("")
@@ -355,6 +386,7 @@ class RAGApp(App):
             value = [record for record in self.events if record["span_id"] == self.inspected_span] if self.inspected_span else {
                 "trace_path": str(self.selected_path) if self.selected_path else None,
                 "run": self.terminal, "route_plan": self.plan,
+                "session_stats": session_stats(self.session_runs.values()),
                 "conversation": self.events[0]["payload"] if self.events else None,
             }
             self.query_one("#payload-json", TextArea).load_text(json.dumps(value, ensure_ascii=False, indent=2))
@@ -388,6 +420,7 @@ class RAGApp(App):
         self.graph.checkpointer.delete_thread(self.session_id)
         self.session_id = uuid4().hex
         self.runs.clear()
+        self.session_runs.clear()
         self.reset_view()
         self.query_one("#runs", Select).set_options([])
         self.query_one("#chat", RichLog).clear()

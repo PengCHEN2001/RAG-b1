@@ -11,6 +11,8 @@ else:
     from .functions import FUNCTION_REGISTRY, get_function_declarations
     from .safety import execute_bounded
 
+from llm.instrumentation import generate_content
+
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "sql" / "wahadb.sqlite"
 
 FIXED_FUNC_SYSTEM_PROMPT = """Select at most one registered function for the request.
@@ -87,14 +89,15 @@ def make_sql_query(sql: str, args: dict[str, str]) -> list[tuple]:
     return execute_bounded(DB_PATH, sql, args).rows
 
 
-def sql_retrieve_fixed_funcs(query: str, *, client=None) -> list[tuple] | None:
+def sql_retrieve_fixed_funcs(query: str, *, client=None, on_llm_event=None, cancel_event=None) -> list[tuple] | None:
     """Select and execute a fixed query; return rows, or None if no tool fits."""
     if client is None:
         from llm.llm import llm_client
 
         client = llm_client
 
-    response = client.models.generate_content(
+    response = generate_content(
+        client, purpose="sql.fixed_function", on_event=on_llm_event, cancel_event=cancel_event,
         model="gemini-3.5-flash-lite",
         contents=query,
         config={

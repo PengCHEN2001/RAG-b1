@@ -2,7 +2,7 @@
 
 ## Overview
 
-RAG-b1 is a Warhammer 40K question-answering project. It will use the core rulebook PDF for game rules and the SQLite database for unit data.
+RAG-b1 is a Warhammer 40K question-answering project using a core rulebook PDF and SQLite unit data through a LangGraph agent, with CLI / Textual TUI interfaces and local graph traces.
 
 ## Project Structure
 
@@ -33,6 +33,10 @@ RAG-b1/
 ├── retrieval/
 │   ├── __init__.py
 │   └── rulebook_retriever.py
+├── agent/                 # State, planning, retrieval/answer graphs, turn runner and traces
+├── ui/
+│   ├── cli.py             # python -m ui.cli
+│   └── tui.py             # python -m ui.tui
 ├── tests/
 │   ├── test_pdf_parser.py
 │   ├── test_chunker.py
@@ -297,6 +301,107 @@ Fixed queries, generated queries, and entity lookups all use `execute_bounded()`
 Only a generated query's syntax or name-resolution failure permits one model repair with bounded compilation diagnostics. Empty results, permission denials, parameter errors, and execution-budget failures do not retry. A failed fixed request does not automatically switch to generation. Fixed requests normally use one model call; generated requests use two, or three when a repair is attempted.
 
 
+## Agent Graphs and Conversation Replies
+
+`agent/nodes.py` provides `prepare_turn(state)` and `plan(state, *, client=None, model=...)`.
+
+- Callers supply the new `user_input` and `run_id`. `prepare_turn` increments the turn index, clears previous working results, and preserves conversation context and pending clarification. It keeps up to eight committed turns within an approximate 5,000-token history budget, using LangGraph's `Overwrite` to replace the message window.
+- `plan` makes one structured Google GenAI call to resolve conversational references, choose a source route, and plan source-specific questions. For rulebook routes, it constructs the existing `RulebookQuerySet` and copies the original input directly. The two `both` modes are distinguished by `depends_on_sql`.
+- Planning receives history, explicit conversation conditions, and actual pending candidates. The model reports when a new topic should clear old conditions and pending clarification. It does not append an assistant message or run either retriever.
+- Inject a GenAI-compatible `client` for testing; the default client is loaded lazily from `llm.llm`. Pydantic validates the response and route/query consistency. Invalid output and provider errors propagate without automatic retries or alternative retrieval.
+
+`agent/graph.py` provides `build_agent_graph()` for complete turns: evidence collection → `respond` → `finalize`. `build_evidence_graph()` retains the evidence-only entry point for retrieval inspection and evaluation.
+
+```python
+from uuid import uuid4
+from agent import EvidenceContext, build_agent_graph
+
+graph = build_agent_graph()    # Keep this graph for the session.
+context = EvidenceContext()    # Default clients/models load only when needed.
+config = {"configurable": {"thread_id": "session-1"}}
+result = graph.invoke(
+    {"user_input": "Which abilities does Warboss have? And find core rules related to them.", "run_id": str(uuid4())},
+    config,
+    context=context,
+)
+print(result["answer"], result["outcome"], result["citations"])
+
+# A follow-up uses the same graph, context and thread_id, with a fresh run_id.
+followup = graph.invoke(
+    {"user_input": "What about its Toughness?", "run_id": str(uuid4())},
+    config,
+    context=context,
+)
+print(followup["answer"])
+```
+
+- Pass `context` explicitly to every `invoke` / `stream`. Reuse the context to reuse the lazy rulebook instance. Inject `client`, `model`, `rulebook_retriever`, or a `sql_retriever(question)` callable for offline use. Runtime dependencies are excluded from checkpoints.
+- Both routes run SQL first. Independent `both` uses the planned rulebook query directly; dependent `both` makes at most one refinement call using returned SQL facts. SQL clarification stops both modes and retains the full request and actual candidates. SQL empty/error/unsupported stops dependent retrieval; independent rulebook retrieval can continue with partial evidence.
+- Refinement uses at most 50 SQL rows and 32 KiB of serialized SQL context, removing whole trailing rows. `sql_context_truncated` records this separate from `sql_result.truncated`; the original result is unchanged. With no usable rows, dependent retrieval stops without guessing. SQLite blobs are labeled as hex in the prompt and remain bytes in state.
+- `evidence_status` is `ok / empty / partial / needs_clarification / unsupported / error / skipped`; `retrieval_errors` distinguishes rulebook availability failures from empty hits. `ok` means all requested evidence sources returned rows/chunks, not a semantic correctness score. Invalid model output / provider failures propagate and leave the last checkpoint available; the evidence summary remains unset when the graph fails before completion.
+- `InMemorySaver` retains node checkpoints under `thread_id`; its serializer explicitly registers the existing result dataclasses and restores tuple fields. Reusing the graph and ID continues a session; a new ID isolates state. It does not persist across process exit, rotate old checkpoints, or provide detailed retriever traces yet.
+- To monitor node completion directly, use `graph.stream(..., stream_mode="updates", context=context)`; each update is keyed by node name. For retained traces and node lifecycle timings, use the turn runner below. Nested retriever phases, actual model requests/usage and answer-token streaming remain separate steps.
+
+`agent/response.py` provides `respond(state, *, client=None, model=...)` and `finalize(state)`:
+
+- `respond` makes one structured GenAI call with the original-language question, standalone request, actual evidence, source statuses and limitations. It does not send old answers as factual evidence. The outer workflow uses two model calls normally (plan + respond), three for dependent `both`; SQL's internal calls are additional. Clarification, direct and unsupported replies also use this response call for natural-language wording.
+- The application assigns `[R1]` etc. to supplied chunks and `[S1]` to this turn's SQL result. It validates inline IDs and stores only cited references: rulebook citations map to original chunk IDs; SQL maps to `<run_id>:sql`, resolvable through `sql_result` including SQL, parameters, rows and truncation. Fact replies require citations unless explicitly reporting insufficient evidence. Unknown IDs abort without a retry or a committed reply. Reference existence is checked; semantic support and response language still require real-model evaluation.
+- Answer SQL context shares the 50-row / 32-KiB limit with refinement. Rulebook context uses at most five complete chunks within 32 KiB of serialized chunk data. `answer_context_truncated` records each source's clipping separately from refinement's `sql_context_truncated` and the original SQL `truncated` flag. Original results remain intact; omitted evidence cannot be cited. These limits do not enforce the planned exact total request-token budget.
+- Outcomes are computed by the application. Evidence `empty` becomes `partial`, `skipped` becomes `completed`, and clarification/unsupported/error retain their meanings. Partial retrieval, answer clipping, reported insufficient evidence or failing to cite all requested source types cannot become `completed`. SQL clarification replies append the exact numbered candidate dictionaries in stored order, after the model's question.
+- The same response can propose at most eight memory updates (`unit/unit_id`, `faction/faction_id`, `detachment/detachment_id`, `topic`, `conditions`). User values must be verbatim substrings of the current input; SQL identities must match unique values from recognized entity columns of an untruncated result. Arbitrary aliases, statistics and multi-entity lists do not populate SQL memory. Values carry the current `source_run_id`; changed names/IDs clear an old unmatched identity partner. Grounding verifies provenance, not the semantic suitability of every chosen slot.
+- `finalize` merges validated scope updates and commits one Human/AI pair with stable `<run_id>:user/assistant` IDs. Repeating the commit replaces those IDs rather than duplicating them. The committed window is trimmed to eight full turns and approximately 5,000 tokens, using the same policy as preparation. Clarification/unsupported and valid partial replies are committed; error/cancelled outcomes and missing replies are not. No extra summarization or memory-extraction model call is added.
+
+Direct graph calls propagate generation failures, malformed response JSON, invalid references or ungrounded memory updates and retain the last successful checkpoint. No incomplete reply or new memory is committed. The turn runner converts those exceptions and Ctrl-C into terminal run results. The evidence-only graph still leaves `answer / outcome` unset. See the [Agentic RAG Spec](agentic-rag-spec.md).
+
+## CLI and Local Graph Traces
+
+Configure `GOOGLE_API_KEY` in `.env`, provide `data/sql/wahadb.sqlite`, and build the rulebook indexes using the commands below. Run from the project root:
+
+```bash
+uv run python -m ui.cli --trace
+uv run python -m ui.cli "Which abilities does Warboss have?" --trace --sources
+uv run python -m ui.cli --inspect data/traces/SESSION/RUN.jsonl --sources
+uv run python -m ui.cli --inspect data/traces/SESSION/RUN.jsonl --json
+```
+
+- Omit the question for an interactive session. `/new` starts isolated memory and deletes the old thread's in-memory checkpoints; it keeps its trace files. `/sources` displays all cited sources, `/sources S1` one source, `/trace` toggles live step display, and `/quit` or EOF exits. Ctrl-C at the prompt exits; during a turn it records cancellation and returns to the prompt. Single-question error/cancellation exits with status 1/130; other outcomes return 0.
+- Answers and requested source JSON go to stdout; progress, route, source status/count, session/run/turn IDs, SQL strategy, outcome, total latency and trace path go to stderr. Steps and route reasons are shown with `--trace`. Replies currently appear as whole messages, without token streaming.
+- Disk tracing is on even when live step display is off. `--no-trace` disables files and can be combined with `--trace` for display only. `--trace-dir PATH` selects another local directory. No transcript is loaded into a new process automatically.
+- `agent.runtime.run_turn(graph, context, *, session_id, question, trace_dir=..., on_event=None, cancel_event=None)` is shared by the CLI and TUI. It consumes LangGraph's native `tasks` and `custom` streams, issues fresh run IDs, and sends the same redacted event records to the callback and JSONL writer. Keep a graph/context and session ID for follow-ups; use caller-generated internal session IDs, not arbitrary paths. `cancel_event` accepts a `threading.Event` for cooperative cancellation between graph events and SDK calls.
+- Each run writes `data/traces/<session_id>/<run_id>.jsonl`, with a `session.json` manifest containing creation time, model, Python/LangGraph versions, lock-file hash and working-source hash. The code hash identifies changes but does not retain a runnable code snapshot; data/index fingerprints and historical environments are not captured yet. Scope is graph events plus observed LLM SDK calls/usage; full model requests and retriever internals remain unavailable. Existing session manifests describe their creation-time capabilities; each run's events and summary describe its actual usage coverage.
+- Events contain schema version, session/run IDs, sequence, UTC timestamp, event/node, span and parent IDs. They cover `run.started`, node `step.started/finished/failed`, `route.selected`, `query.refined`, `retrieval.completed` and exactly one `run.finished` for a controlled turn. Node starts snapshot their actual State input; finishes snapshot updates, including history trimming/overwrite, planned queries, bounded retriever results, PDF metadata, SQL provenance, answer, citations and memory commits. These are **graph-node** inputs, not a recording of the exact model HTTP requests.
+- Durations use a monotonic clock and measure observed node lifecycles, including stream/trace/display overhead; run time includes cold model initialization. LLM events record observed SDK-call duration, including any SDK-internal retries. SQL's non-LLM internal phases, raw model outputs, repair SQL before/after snapshots and rulebook intermediate candidate rankings remain unavailable.
+- The writer flushes each complete JSON line. It does not promise power-loss durability. Write/open/close failures emit a visible `trace.failed` warning and mark the returned trace incomplete while preserving a valid answer. Error records retain exception type, validation locations and stack file/function/line locations, omitting raw provider messages, locals and source lines. Known configured API keys and credential fields are redacted; SDK clients and authentication headers are never serialized from runtime context.
+- `--inspect` reads saved records without building/resuming a graph or calling a model/SQL. It shows lifecycle, route and result; `--sources` resolves actual cited chunks or executed SQL, bindings, full bounded rows and separate prompt-clipping flags. `--json` exposes full recorded node snapshots. An incomplete final JSON fragment is skipped with a warning; a run without `run.finished` is `interrupted`. Corrupt middle records or mixed run IDs/sequence are rejected. This is replay of recorded facts, not a rerun of the original experiment.
+
+The lower-level graph still propagates exceptions. The runner's returned outcome is authoritative for failed/cancelled turns: its returned State copy clears answer/citations; the underlying checkpoint retains the last successful node for debugging. Cancellation does not forcibly terminate synchronous provider/model calls; it may wait for an in-flight call to return before the stream stops. No new turn is submitted during that wait. Once `finalize` starts, the memory commit completes and the committed outcome wins over a late cancellation. Automatic checkpoint rotation for long sessions and detailed retriever instrumentation remain pending.
+
+### Textual TUI
+
+```bash
+uv run python -m ui.tui
+uv run python -m ui.tui --model gemini-3.1-flash-lite
+uv run python -m ui.tui --inspect data/traces/SESSION/RUN.jsonl
+```
+
+`ui/tui.py` uses a Textual thread worker to call the same runner as the CLI. Only redacted trace messages cross into the UI through thread-safe `post_message`; stdout/stderr output is not parsed. One turn runs at a time. Input, New and the turn selector are disabled until the worker returns. Esc requests cancellation; Ctrl+Q requests cancellation and quits after the worker returns.
+
+The chat is paired with an inspector showing session/run/turn/model, route and `both` dependency, observed step/total timings, SQL strategy/row count, rulebook count, clipping indicators, trace status and failed node. LLM child rows show each actual SDK call; metadata shows per-turn and session calls/tokens/coverage. Select a turn to load its retained JSONL on demand; Enter on a step opens its complete redacted input/output in Payload. Select `run.finished` for the complete final state, usage breakdown, error/stack locations, context and clarification metadata. Sources resolves cited SQL/parameters/rows and rulebook chunk IDs/pages/text/scores through `source_details`. The inspector can be toggled with Ctrl+T or `/trace`; below 100 columns it replaces the chat view. Ctrl+S or `/sources [ID]` opens sources.
+
+`/new` starts a fresh session, deletes the old in-process checkpoints and clears the UI's run list, while retaining disk traces. The chat rendering buffer is limited to 1,000 lines; only the selected run's full events/state are retained in UI memory. `--no-trace` keeps current inspection but disables access to earlier turn details. `--inspect` is read only: it creates no graph/client and executes no model or SQL calls. It also displays interrupted traces and reader warnings. Live replies appear as complete answers; no answer-token streaming or retriever-internal timings are implied.
+
+Headless UI tests use Textual's `run_test`/Pilot with `unittest.IsolatedAsyncioTestCase`, real graph orchestration and offline model/retriever stubs; no real API calls are required. See [Textual workers](https://textual.textualize.io/guide/workers/) and [testing](https://textual.textualize.io/guide/testing/).
+
+### LLM calls and provider token usage
+
+`llm/instrumentation.py` wraps `generate_content` without changing its response or adding retries. Plan, dependent rulebook-query refinement, response generation, SQL routing/generation/repair and the legacy fixed-function entry use it. Each invocation emits `llm.started` and one `llm.finished`/`llm.failed`, with a unique call ID parented to its graph node. Events retain purpose, requested model, provider, monotonic duration, response ID/model version when supplied, and usage. Provider error text, credentials, prompts and raw responses are not copied into LLM metadata events. Usage is captured before JSON/citation validation, so invalid structured output still counts. `llm_calls` counts SDK invocations including failed calls; it does not claim to count HTTP retries hidden inside the SDK or evaluation-judge calls.
+
+Provider usage preserves nullable `prompt_token_count`, `candidates_token_count`, `thoughts_token_count`, `cached_content_token_count`, `tool_use_prompt_token_count` and `total_token_count`. Values are reported, never estimated; cached tokens are not added to prompt tokens and the provider's total is not reconstructed from a formula. API errors or an absent usage response have `usage: null` at the call level. A missing field stays null; an explicitly reported zero stays zero.
+
+`run.finished` and the runner result expose `llm_calls` and a `usage` summary. Each token total is null unless every observed call reports that field and the instrumented scope is complete. `known_totals` holds only reported subtotals, `reported_calls` gives coverage per field, and `total_calls` is the observed-call denominator. `complete` requires complete prompt/candidate/total coverage; optional thinking/cache/tool fields may remain null. A question-only injected SQL callable is opaque when executed: `instrumentation_complete=false` marks that boundary, while retaining counts and known usage from instrumented calls. There are no usage counters in checkpointed `AgentState` or future prompts.
+
+CLI/TUI also reduce run summaries into session totals, keyed by run ID; history selection never adds the same run again. `/new` resets totals. `--no-trace` still records live statistics in memory. Old traces stay unavailable and are not estimated from node counts. Evaluation's trace adapter passes through the same fields. During cancellation the runner waits for in-flight work and drains retained LLM events before writing `run.finished`, preserving any returned usage even when no answer is committed. A killed process can leave only `llm.started`; its consumed tokens remain unknown.
+
 ## Build and Simple Verification
 
 ```bash
@@ -307,7 +412,7 @@ uv run python -m ingestion.build_index "data/processed/Core Rules.chunks.jsonl" 
 uv run python -m retrieval.rulebook_retriever "How does a wound roll work?" \
   --semantic-query "How is a wound roll resolved in the Core Rules?" \
   --keyword-query "Wound Roll" Strength Toughness
-uv run python -m unittest tests.test_pdf_parser tests.test_chunker tests.test_rulebook_retriever -v
+uv run python -m unittest discover -s tests -v
 ```
 
 Add `--ocr` to the parser command when OCR is needed. The first run may download Docling model files.

@@ -95,8 +95,8 @@ def load_evaluation_trace(path: str | Path) -> dict[str, Any]:
         "step_durations_ms": step_durations,
         "failed_node": payload.get("failed_node"),
         "error": payload.get("error"),
-        # The runtime currently records these as null. Keeping the fields now
-        # avoids changing the evaluation record shape when usage tracking lands.
+        # Legacy traces retain null; current traces carry observed SDK-call
+        # counts, provider usage and explicit coverage without token estimates.
         "llm_calls": payload.get("llm_calls"),
         "usage": payload.get("usage"),
         "first_answer_token_ms": payload.get("first_answer_token_ms"),

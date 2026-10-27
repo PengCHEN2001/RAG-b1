@@ -7,6 +7,7 @@ from langchain_core.messages.utils import count_tokens_approximately, trim_messa
 from langgraph.types import Overwrite
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from llm.instrumentation import generate_content
 from retrieval.rulebook_retriever import RulebookQuerySet
 
 from .state import AgentState, Route, RoutePlan
@@ -139,7 +140,8 @@ def prepare_turn(state: AgentState) -> dict[str, object]:
     }
 
 
-def plan(state: AgentState, *, client=None, model: str = DEFAULT_MODEL) -> dict[str, object]:
+def plan(state: AgentState, *, client=None, model: str = DEFAULT_MODEL,
+         on_llm_event=None, cancel_event=None) -> dict[str, object]:
     """Rewrite context and plan sources with one injected or default model call.
 
     Invalid model output raises ValidationError; provider failures propagate.
@@ -159,7 +161,8 @@ def plan(state: AgentState, *, client=None, model: str = DEFAULT_MODEL) -> dict[
         "conversation_context": state.get("conversation_context", {}),
         "pending_clarification": state.get("pending_clarification"),
     }
-    response = client.models.generate_content(
+    response = generate_content(
+        client, purpose="plan", on_event=on_llm_event, cancel_event=cancel_event,
         model=model,
         contents=json.dumps(content, ensure_ascii=False),
         config={

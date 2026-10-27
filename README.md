@@ -18,6 +18,8 @@ The TUI shows chat alongside live node timings, routes and retrieval counts. Sel
 
 Open a retained run in the same TUI without API calls: `uv run python -m ui.tui --inspect data/traces/SESSION/RUN.jsonl`. Both interfaces support `--model`, `--trace-dir` and `--no-trace`. Disabling trace files leaves only the current turn available for inspection.
 
+CLI/TUI report LLM SDK calls and provider token usage per turn and session, including SQL routing, generation and repair. API errors and missing usage remain `null`; incomplete totals retain separate known subtotals and coverage counts. `/new` resets session totals, and inspecting an old turn does not count it again. Token reporting works with `--no-trace`; older traces show unavailable usage.
+
 ## Documentation
 
 - See the [Project Guide](docs/project-guide.md) for the project structure, current design, setup, usage, and testing instructions.
