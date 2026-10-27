@@ -29,11 +29,12 @@ from evaluation.metrics import (
     score_sql_case,
 )
 from evaluation.ragas_adapter import evaluate_ragas_cases
+from llm.llm_config import get_gemini_model, get_ragas_model
 
 
 ROOT = Path(__file__).resolve().parent.parent
 DATASET_CHOICES = ("all", "rulebook", "text2sql", "combined")
-DEFAULT_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_MODEL = get_gemini_model()
 DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
 
 
@@ -351,8 +352,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=DATASET_CHOICES, default="all")
     parser.add_argument("--ragas", action="store_true")
-    parser.add_argument("--model", default=os.getenv("GEMINI_MODEL", DEFAULT_MODEL))
-    parser.add_argument("--judge-model", default=os.getenv("RAGAS_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--model", default=get_gemini_model())
+    parser.add_argument("--judge-model", default=get_ragas_model())
     parser.add_argument("--embedding-model", default=os.getenv("RAGAS_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL))
     parser.add_argument("--output-root", type=Path, default=ROOT / "evaluation")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d_%H%M%S"))

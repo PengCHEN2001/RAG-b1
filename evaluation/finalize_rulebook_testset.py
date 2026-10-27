@@ -14,6 +14,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from llm.llm_config import get_gemini_model
+
 from evaluation.generate_rulebook_testset import (
     DEFAULT_CHUNKS,
     ROOT,
@@ -199,7 +201,7 @@ def finalize() -> list[dict[str, Any]]:
 
 def main() -> None:
     load_dotenv(ROOT / ".env")
-    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    model = get_gemini_model()
     embedding_model = os.getenv("RAGAS_EMBEDDING_MODEL", "models/gemini-embedding-001")
     cases = finalize()
     write_jsonl(DEFAULT_OUTPUT, cases)
