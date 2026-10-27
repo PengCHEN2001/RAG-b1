@@ -51,7 +51,13 @@ class EvaluationTraceAdapterTests(unittest.TestCase):
         }
         self.write_events([
             self.event(1, "run.started", {"user_input": "Question"}),
-            self.event(2, "run.finished", {
+            self.event(2, "retrieval.completed", {
+                "source": "sql", "status": "ok", "count": 1,
+            }),
+            self.event(3, "retrieval.completed", {
+                "source": "rulebook", "status": "ok", "count": 1,
+            }),
+            self.event(4, "run.finished", {
                 "outcome": "completed",
                 "duration_ms": 125.5,
                 "step_durations_ms": {"plan": 10.0, "respond": 20.0},
@@ -70,6 +76,8 @@ class EvaluationTraceAdapterTests(unittest.TestCase):
         self.assertEqual(record["sql_result"]["rows"], [["2"]])
         self.assertEqual(record["rulebook_results"][0]["chunk"]["chunk_id"], "chunk-1")
         self.assertEqual(record["answer"], "Answer [S1] [R1]")
+        self.assertEqual(record["retrievers_called"], ["sql", "rulebook"])
+        self.assertEqual(record["citation_sources"], ["rulebook", "sql"])
         self.assertEqual(record["duration_ms"], 125.5)
         self.assertIsNone(record["usage"])
 

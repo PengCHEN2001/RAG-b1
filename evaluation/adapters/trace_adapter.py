@@ -62,6 +62,29 @@ def load_evaluation_trace(path: str | Path) -> dict[str, Any]:
     citations = state.get("citations", {})
     if not isinstance(citations, dict):
         raise TraceAdapterError("state.citations must be an object")
+    citation_sources: set[str] = set()
+    for reference, citation in citations.items():
+        if not isinstance(reference, str) or not isinstance(citation, dict):
+            raise TraceAdapterError("state.citations must map strings to objects")
+        if citation.get("source_type") == "rulebook":
+            citation_sources.add("rulebook")
+        if citation.get("source") in {"sql", "rulebook"}:
+            citation_sources.add(citation["source"])
+
+    retrievers_called: list[str] = []
+    for trace_event in trace["events"]:
+        if trace_event["event"] != "retrieval.completed":
+            continue
+        retrieval_payload = _mapping(
+            trace_event.get("payload"), "retrieval.completed payload"
+        )
+        source = retrieval_payload.get("source")
+        if source not in {"sql", "rulebook"}:
+            raise TraceAdapterError(
+                "retrieval.completed source must be sql or rulebook"
+            )
+        if source not in retrievers_called:
+            retrievers_called.append(source)
     step_durations = payload.get("step_durations_ms", {})
     if not isinstance(step_durations, dict) or not all(
         isinstance(name, str) and isinstance(duration, (int, float))
@@ -90,6 +113,8 @@ def load_evaluation_trace(path: str | Path) -> dict[str, Any]:
         "evidence_status": state.get("evidence_status"),
         "answer": state.get("answer"),
         "citations": citations,
+        "citation_sources": sorted(citation_sources),
+        "retrievers_called": retrievers_called,
         "outcome": payload.get("outcome"),
         "duration_ms": duration_ms,
         "step_durations_ms": step_durations,
