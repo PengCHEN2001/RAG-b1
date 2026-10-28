@@ -265,44 +265,51 @@ The current reranker is `cross-encoder/ms-marco-MiniLM-L6-v2`. It is a small Eng
 
 ## SQL Retriever Design
 
-The main entry point is `retrieve_sql(question: str)` in `sql_retriever/hybrid.py`, also exported as `sql_retriever.retrieve_sql`. It prefers registered parameterized functions when one function can answer the whole question and uses LLM-generated SQL for requests outside their coverage.
+`retrieve_sql(question: str)` retrieves facts from SQLite. It combines fixed parameterized queries with LLM-generated SQL and returns structured evidence for the answer layer.
+
+### Routing (`sql_retriever/hybrid.py`)
+
+The LLM selects one route for the whole question:
+
+- **fixed**: one registered function can fully answer the question. Query builders are defined in `sql_retriever/functions.py`.
+- **generated**: the question needs another database query, such as a comparison, ranking, or complex filter.
+- **unsupported**: the required facts or calculations are outside the database's scope.
 
 ```text
-question: str
-  -> Validate input, load the full data dictionary, and prepare the model client
-  -> LLM routing: return a structured intent
-  -> Validate the JSON, entity declarations, and routing configuration
+Question
+  -> LLM routing
        |
-       +-- unsupported
-       |     -> Return RetrievalResult(status="unsupported")
+       +-- unsupported -> Return limitation
        |
        +-- fixed / generated
-             -> For fixed requests, normalize literal IDs into entity references
-             -> resolve_entities(): normalized exact / phrase / spelling lookup
+             -> Resolve entities
                   |
-                  +-- No match, spelling suggestions, multiple matches, or truncated candidates
-                  |     -> Return needs_clarification with candidates
+                  +-- Unresolved or ambiguous -> Request clarification
                   |
-                  +-- Unique matches, or no entities to resolve
-                        -> resolved entity dictionary
-                             |
-                             +-- fixed
-                             |     -> Validate and substitute entity references
-                             |     -> Registered builder returns SQL + parameters
-                             |
-                             +-- generated
-                                   -> LLM receives the question, resolved entities,
-                                      generation rules, and full data dictionary
-                                   -> Return SQL + parameters, or stop with
-                                      needs_clarification / unsupported
-                                   -> Check parameters and resolved identity bindings
-
-Executable SQL + parameters
-  -> execute_bounded(): authorized, resource-bounded, read-only execution
-  -> Assemble and return RetrievalResult
+                  +-- Resolved
+                        +-- fixed -> Build parameterized SQL
+                        +-- generated -> Generate SQL and check entity constraints
+                              |
+                              -> Read-only execution
+                              -> Structured result
+                              -> Downstream answer generation
 ```
 
-The routing intent contains `mode`, `function`, `arguments`, `entities`, and `message`. For example:
+Fixed requests normally use one model call. Generated requests use two, or three if SQL repair is needed. 
+Answer generation is a separate call.
+
+Both routing and SQL generation receive the complete data dictionary. 
+It describes available tables, columns, and relationships.
+
+Separate generation rules define how to query the data. These rules take precedence over examples in the dictionary.
+
+### Entity Recognition and Resolution (`sql_retriever/entities.py`)
+
+The LLM extracts entity mentions and their context during routing. The application looks them up in SQLite to obtain verified identities.
+
+Supported entities include units, factions, sources, abilities, detachments, enhancements, and stratagems.
+
+For “Show abilities for Warboss”, the routing output can contain:
 
 ```json
 {
@@ -310,109 +317,224 @@ The routing intent contains `mode`, `function`, `arguments`, `entities`, and `me
   "function": "get_unit_abilities",
   "arguments": {"d_id": "@unit"},
   "entities": [
-    {"key": "unit", "kind": "unit", "match": "name", "value": "Warboss"}
+    {
+      "key": "unit",
+      "kind": "unit",
+      "match": "name",
+      "value": "Warboss"
+    }
   ],
   "message": ""
 }
 ```
 
-An entity declaration describes an object to look up. Its `key` is a request-local reference name, `kind` selects a lookup definition from `ENTITY_TABLES`, `match` is the string `"name"` or `"id"`, and `value` must appear in the original question. Optional `faction_key`, `source_key`, and `unit_key` refer to context entity keys in the same request, without an `@` prefix. Abilities also accept an explicitly supplied `line` with `unit_key`. The model extracts these lookup descriptions; the application obtains the actual identities from SQLite.
+`@unit` refers to the entity declaration. The application replaces it with the verified database ID before building SQL.
 
-`validate_entities()` checks the declarations, their occurrence in the question, and context references against the target kind and available foreign keys. On the fixed path, `_normalize_fixed_references()` converts literal `d_id` or `faction_id` arguments into `@entity_key` references, adding and validating ID-based entity declarations where necessary. This sends explicitly supplied IDs through the same database verification as names.
+Faction, source, and owning-unit context narrow the lookup. Explicitly supplied IDs also undergo database lookup and retain leading zeros.
 
-`resolve_entities()` in `sql_retriever/entities.py` resolves factions and sources first, then units before their abilities. Units support both faction and source constraints; abilities additionally support their owning unit. Other faction-linked entities support faction constraints. Explicit context references apply only to their referring entities. A single unreferenced context is shared; multiple unreferenced contexts of one applicable kind require clarification. All applicable filters intersect before name matching, including spelling suggestions. Names use Unicode NFKC, case folding, and whitespace normalization, followed by exact matching, complete-word phrase matching, and `difflib` spelling suggestions. Unique exact or phrase matches resolve automatically; spelling suggestions always require confirmation. IDs use exact string matching and retain leading zeros. It always returns an internal `EntityResolution` with `status`, `resolved`, `candidates`, `message`, and `truncated`. The `resolved` dictionary is indexed by entity key:
+### Ambiguity and Spelling Errors (`sql_retriever/entities.py`)
 
-```json
-{
-  "unit": {
-    "key": "unit",
-    "kind": "unit",
-    "id": "000000001",
-    "name": "Warboss",
-    "faction_id": "ORK",
-    "faction_name": "Orks",
-    "source_id": "000000046",
-    "source_name": "Orks",
-    "matched_text": "Warboss",
-    "match_type": "exact"
-  }
-}
+Names use Unicode, case, and whitespace normalization, followed by:
+
+1. Exact matching.
+2. Complete-word phrase matching.
+3. Spelling suggestions using Python's `difflib`.
+
+A unique exact or phrase match resolves automatically. Spelling suggestions always require confirmation.
+
+Missing matches, multiple matches, and incomplete candidate sets return `needs_clarification`. Candidates include context such as faction, source, or owning unit.
+
+Generation can also request clarification for undefined criteria such as “best” or an unspecified points configuration (`sql_retriever/hybrid.py`).
+
+### Query Semantics (`sql_retriever/hybrid.py`, `sql_retriever/functions.py`)
+
+Generation rules and fixed query builders account for the database's domain conventions:
+
+- Unit-card ability names and descriptions override catalog values.
+- Points belong to a specific unit configuration; results include that configuration.
+- Counts use distinct units where joins can duplicate rows.
+- Statistics stored as text use guarded conversion for numeric operations. Symbolic values remain unchanged when returned.
+
+For example, a value such as `D6` remains a string and is excluded from integer calculations.
+
+### Entity Constraints in Generated SQL (`sql_retriever/constraints.py`)
+
+Generated SQL must preserve verified entity values in named parameters and use them in effective identity filters.
+
+```sql
+SELECT d.name
+FROM datasheets d
+WHERE d.Id = :unit_id
 ```
 
-Uniqueness is determined under the lookup table and applicable filters; an ID is not assumed to be globally unique. Missing, ambiguous, or spelling-only matches return an `EntityResolution` with `status="needs_clarification"`, retaining any identities already resolved. `hybrid.py` converts this into the public `RetrievalResult(status="needs_clarification")` and stops retrieval. Successful resolution uses `status="resolved"`; an empty entity list produces the same status with an empty resolved dictionary and requires no lookup queries.
+Some entities require compound identities:
 
-Candidates include the available faction/source IDs and names, plus `matched_text` and `match_type` to explain the original mention and matching method. Card abilities also include their owning unit and line. Metadata uses left joins so missing optional catalog labels do not remove the entity.
+- Catalog abilities use ability ID and faction ID.
+- Unit-card abilities use unit ID and card line.
 
-Ability lookup combines the `abilities` catalog with named `datasheets_abilities` rows. Under a unit or source constraint it also includes card rows that inherit their catalog name. A catalog ability keeps its verified `id`; a card ability uses the real `(DatasheetId, line)` identity as `unit_id` and `line`. Its optional `ability_id` is only a catalog link. Card names and descriptions override catalog values, and catalog joins require a matching faction or a shared core ability with an empty faction ID.
+SQLGlot checks identity filters through the SQL syntax tree, including supported joins, subqueries, and set operations. This check covers entity constraints; general query semantics still depend on the generated SQL.
 
-Name catalogs are scanned without the business-query row cap, retaining the executor's byte, time, and VM budgets. An incomplete catalog requires narrower context instead of accepting a partial match. Exact and phrase candidates are capped at 200, spelling suggestions at five; omitted candidates set `truncated`. Spelling recall uses `get_close_matches` with a 0.6 cutoff, not a calibrated identity confidence. Catalogs are small enough for a per-lookup scan; no search service or additional dependency is required.
+### Safe Execution (`sql_retriever/safety.py`)
 
-On the fixed path, `_fixed_query()` checks reference types and substitutes verified IDs. Both this path and the legacy JSON selection parser call `build_fixed_query()` to validate model-supplied arguments once before invoking a trusted builder. A role filter must be explicitly supplied in the question. On the generated path, the second model call receives `required_bindings` and returns `mode`, `sql`, `parameters`, and `message`; only `mode="query"` proceeds to execution. The application checks exact parameter values: `<entity_key>_id` for catalog entities, an additional `<entity_key>_faction_id` for catalog abilities (empty for shared core rules), or `<entity_key>_unit_id` and `<entity_key>_line` for card abilities.
+Fixed queries, generated queries, and entity lookups share one bounded SQLite executor.
 
-`get_unit_model_stats(d_id)` handles one unit's characteristic lookup, including a single value such as Toughness. It returns every model profile with unit/model identity, movement, toughness, save, invulnerable save, wounds, leadership and objective control. Symbolic values remain strings. Cross-unit comparisons, rankings and numeric filters still use generation.
+It enforces:
 
-`constraints.validate_entity_constraints()` uses SQLGlot's SQLite AST and scopes to verify effective identity filters in `WHERE` or inner-join `ON` predicates. It accepts direct key equalities and lists of resolved single-key IDs, inherits filters from required input CTEs/derived tables, and checks every set-operation branch. Compound card and catalog-ability identities must constrain the same table alias. Parameter mentions in projections, unused CTEs, scalar subqueries, or optional left-join conditions do not suffice. Unproven forms return `sql_policy`; resolved-entity queries do not accept right/full joins. See `docs/sql_entity_matching.md` for supported forms and limits.
+- Read-only access.
+- Allowed tables and functions.
+- One SQL statement per execution.
+- Parameter validation.
+- Execution-time, computation, and result-size limits.
 
-Both model stages receive the complete unchanged `data/sql/SQL_AGENT_DATA_DICTIONARY.md`. Generation rules take precedence over its examples and add semantic guidance, including card-specific ability overrides, distinct counts, cost configurations, and a guarded TEXT-to-integer template. AST validation covers resolved identity filters only; it does not prove general join, numeric, projection, or natural-language semantics. There is no separate live-schema validator.
+Results that exceed the output budget are marked as truncated.
 
-Fixed queries, generated queries, and entity lookups all use `execute_bounded()` in `sql_retriever/safety.py`. It validates input boundaries, opens a read-only connection, applies business-table and function authorization, executes one statement, and enforces execution and result budgets. It returns `columns`, `rows`, and `truncated`. The outer retriever adds the executed SQL, parameters, strategy, and status: non-empty or truncated results are `ok`; an empty, untruncated result is `empty`. Expected validation, model, and execution failures become `error` results with an `error_code`. Natural-language answer generation belongs to the downstream answer layer.
+### Errors and Repair (`sql_retriever/hybrid.py`, `sql_retriever/safety.py`)
 
-Only a generated query's syntax or name-resolution failure permits one model repair with the failed SQL, its parameters, and bounded compilation diagnostics. Repair retains the original question and resolved identities and never receives database result rows. Corrected SQL undergoes the same identity and execution checks. Empty results, identity-policy failures, permission denials, parameter errors, and execution-budget failures do not retry. A failed fixed request does not automatically switch to generation. Fixed requests normally use one model call; generated requests use two, or three when a repair is attempted.
+Only generated SQL with syntax or name-resolution errors receives one repair attempt. 
+The model receives the failed SQL, parameters, and bounded diagnostics. Repaired SQL passes through the same checks.
 
+Empty results, identity-policy failures, permission errors, parameter errors, and execution-budget failures return directly.
+
+A failed fixed query does not automatically switch to generated SQL.
+
+### Results and Answer Generation (`sql_retriever/result.py`, `agent/response.py`)
+
+The retriever returns one of five statuses:
+
+- `ok`
+- `empty`
+- `needs_clarification`
+- `unsupported`
+- `error`
+
+Results include applicable rows, columns, SQL, parameters, strategy, clarification candidates, and truncation or error information.
+
+The downstream answer layer uses this evidence to generate an answer with source references. It preserves clarification choices and explains missing or truncated evidence. An empty result means the query found no matching evidence; truncated results support only partial conclusions.
 
 ## Agent Graphs and Conversation Replies
 
-`agent/nodes.py` provides `prepare_turn(state)` and `plan(state, *, client=None, model=...)`.
+The agent uses LangGraph to plan each request, collect evidence, generate a reply, and update conversation state.
 
-- Callers supply the new `user_input` and `run_id`. `prepare_turn` increments the turn index, clears previous working results, and preserves conversation context and pending clarification. It keeps up to eight committed turns within an approximate 5,000-token history budget, using LangGraph's `Overwrite` to replace the message window.
-- `plan` makes one structured Google GenAI call to resolve conversational references, choose a source route, and plan source-specific questions. For rulebook routes, it constructs the existing `RulebookQuerySet` and copies the original input directly. The two `both` modes are distinguished by `depends_on_sql`.
-- For a pure `sql` route, the application passes `standalone_question` directly to SQL retrieval instead of using a second model-authored query. For `both`, `sql_question` remains the natural-language database subquestion. Planning receives no data dictionary and must preserve supplied names and avoid generating SQL; the SQL retriever owns schema interpretation and receives the dictionary in routing and generation.
-- Planning receives history, explicit conversation conditions, and actual pending candidates. The model reports when a new topic should clear old conditions and pending clarification. It does not append an assistant message or run either retriever.
-- Clarification replies also receive the actual pending candidates, including their kinds; the application still appends the exact numbered candidate list.
-- Inject a GenAI-compatible `client` for testing; the default client is loaded lazily from `llm.llm`. Pydantic validates the response and route/query consistency. Invalid structured output propagates without an alternative route. Temporary provider failures first pass through the shared bounded retry policy; permanent failures and exhausted retries propagate to the runner.
+### Workflow (`agent/graph.py`)
 
-`agent/graph.py` provides `build_agent_graph()` for complete turns: evidence collection → `respond` → `finalize`. `build_evidence_graph()` retains the evidence-only entry point for retrieval inspection and evaluation.
+`build_agent_graph()` runs the complete turn. `build_evidence_graph()` stops after evidence collection for inspection and evaluation.
 
-```python
-from uuid import uuid4
-from agent import EvidenceContext, build_agent_graph
+```text
+User input + conversation context
+  -> prepare_turn
+  -> plan
+       +-- sql: SQL retrieval
+       +-- rulebook: Rulebook retrieval
+       +-- both: SQL retrieval -> optional query refinement -> Rulebook retrieval
+       +-- direct / clarify / unsupported: Skip retrieval
 
-graph = build_agent_graph()    # Keep this graph for the session.
-context = EvidenceContext()    # Default clients/models load only when needed.
-config = {"configurable": {"thread_id": "session-1"}}
-result = graph.invoke(
-    {"user_input": "Which abilities does Warboss have? And find core rules related to them.", "run_id": str(uuid4())},
-    config,
-    context=context,
-)
-print(result["answer"], result["outcome"], result["citations"])
-
-# A follow-up uses the same graph, context and thread_id, with a fresh run_id.
-followup = graph.invoke(
-    {"user_input": "What about its Toughness?", "run_id": str(uuid4())},
-    config,
-    context=context,
-)
-print(followup["answer"])
+Selected path
+  -> finish_evidence
+  -> respond
+  -> finalize
 ```
 
-- Pass `context` explicitly to every `invoke` / `stream`. Reuse the context to reuse the lazy rulebook instance. Inject `client`, `model`, `rulebook_retriever`, or a `sql_retriever(question)` callable for offline use. Runtime dependencies are excluded from checkpoints.
-- Both routes run SQL first. Independent `both` uses the planned rulebook query directly; dependent `both` makes at most one refinement call using returned SQL facts. SQL clarification stops both modes and retains the full request and actual candidates. SQL empty/error/unsupported stops dependent retrieval; independent rulebook retrieval can continue with partial evidence.
-- Refinement uses at most 50 SQL rows and 32 KiB of serialized SQL context, removing whole trailing rows. `sql_context_truncated` records this separate from `sql_result.truncated`; the original result is unchanged. With no usable rows, dependent retrieval stops without guessing. SQLite blobs are labeled as hex in the prompt and remain bytes in state.
-- `evidence_status` is `ok / empty / partial / needs_clarification / unsupported / error / skipped`; `retrieval_errors` distinguishes rulebook availability failures from empty hits. `ok` means all requested evidence sources returned rows/chunks, not a semantic correctness score. Invalid model output and provider failures remaining after bounded retries propagate and leave the last checkpoint available; the evidence summary remains unset when the graph fails before completion.
-- `InMemorySaver` retains node checkpoints under `thread_id`; its serializer explicitly registers the existing result dataclasses and restores tuple fields. Reusing the graph and ID continues a session; a new ID isolates state. It does not persist across process exit, rotate old checkpoints, or provide detailed retriever traces yet.
-- To monitor node completion directly, use `graph.stream(..., stream_mode="updates", context=context)`; each update is keyed by node name. For retained traces and node lifecycle timings, use the turn runner below. Nested retriever phases, actual model requests/usage and answer-token streaming remain separate steps.
+`prepare_turn` clears previous working results while retaining conversation context and pending clarification (`agent/nodes.py`).
 
-`agent/response.py` provides `respond(state, *, client=None, model=...)` and `finalize(state)`:
+### Planning and Source Routing (`agent/nodes.py`)
 
-- `respond` makes one structured GenAI call with the original-language question, standalone request, actual evidence, source statuses and limitations. It does not send old answers as factual evidence. The outer workflow uses two model calls normally (plan + respond), three for dependent `both`; SQL's internal calls are additional. Clarification, direct and unsupported replies also use this response call for natural-language wording.
-- The application assigns `[R1]` etc. to supplied chunks and `[S1]` to this turn's SQL result. A response may cite one source or combine complementary evidence from several sources; citations can be written separately (`[R1] [R3]`) or as a comma-separated group (`[R1, R3]`). The parser normalises these forms, validates every ID against evidence supplied during the current turn, and stores only cited references: rulebook citations map to original chunk IDs; SQL maps to `<run_id>:sql`, resolvable through `sql_result` including SQL, parameters, rows and truncation. Fact replies require citations unless explicitly reporting insufficient evidence. Unknown or malformed IDs abort without a retry or a committed reply. Reference existence is checked; semantic support and response language still require real-model evaluation.
-- Answer SQL context shares the 50-row / 32-KiB limit with refinement. Rulebook context uses at most five complete chunks within 32 KiB of serialized chunk data. `answer_context_truncated` records each source's clipping separately from refinement's `sql_context_truncated` and the original SQL `truncated` flag. Original results remain intact; omitted evidence cannot be cited. These limits do not enforce the planned exact total request-token budget.
-- Outcomes are computed by the application. Evidence `empty` becomes `partial`, `skipped` becomes `completed`, and clarification/unsupported/error retain their meanings. Partial retrieval, answer clipping, reported insufficient evidence or failing to cite all requested source types cannot become `completed`. SQL clarification replies append the exact numbered candidate dictionaries in stored order, after the model's question.
-- The same response can propose at most eight memory updates (`unit/unit_id`, `faction/faction_id`, `detachment/detachment_id`, `topic`, `conditions`). User values must be verbatim substrings of the current input; SQL identities must match unique values from recognized entity columns of an untruncated result. Arbitrary aliases, statistics and multi-entity lists do not populate SQL memory. Values carry the current `source_run_id`; changed names/IDs clear an old unmatched identity partner. Grounding verifies provenance, not the semantic suitability of every chosen slot.
-- `finalize` merges validated scope updates and commits one Human/AI pair with stable `<run_id>:user/assistant` IDs. Repeating the commit replaces those IDs rather than duplicating them. The committed window is trimmed to eight full turns and approximately 5,000 tokens, using the same policy as preparation. Clarification/unsupported and valid partial replies are committed; error/cancelled outcomes and missing replies are not. No extra summarization or memory-extraction model call is added.
+One structured model call produces a standalone question and selects a route:
 
-Direct graph calls propagate generation failures, malformed response JSON, invalid references or ungrounded memory updates and retain the last successful checkpoint. No incomplete reply or new memory is committed. The turn runner converts those exceptions and Ctrl-C into terminal run results. The evidence-only graph still leaves `answer / outcome` unset. See the [Agentic RAG Spec](agentic-rag-spec.md).
+| Route | Purpose |
+|---|---|
+| `sql` | Stored unit facts, attributes, and relationships. |
+| `rulebook` | Core Rules, terms, and procedures. |
+| `both` | Questions requiring both sources. |
+| `direct` | Greetings and application help. |
+| `clarify` | Unresolved conversational references or missing conditions. |
+| `unsupported` | Requests outside the available sources and capabilities. |
+
+For `sql`, the standalone question passes directly to SQL retrieval. For `both`, the planner extracts a natural-language database subquestion. Rulebook requests receive an English semantic query and keyword terms.
+
+The SQL retriever owns schema interpretation, entity lookup, and SQL generation. Pydantic validates the plan and route/query consistency.
+
+### Conversation References and Clarification (`agent/nodes.py`, `agent/response.py`)
+
+Planning uses recent turns, explicit conversation conditions, and pending clarification candidates to resolve references.
+
+```text
+Previous question: Which abilities does Warboss have?
+Current question: What about its Toughness?
+Standalone question: What is the Toughness of Warboss?
+```
+
+Names, exact IDs, and user conditions are preserved. Current explicit conditions override earlier ones. A new topic clears previous conditions and pending clarification.
+
+For a reply such as “the second one”, the planner uses the stored candidate order to reconstruct the pending request. Clarification replies append the exact numbered candidates supplied by retrieval.
+
+Entity ambiguity and spelling suggestions remain the SQL retriever's responsibility.
+
+### Combining SQL and Rulebook Retrieval (`agent/graph.py`)
+
+The `both` route runs SQL first and supports two cases:
+
+- **Independent retrieval**: the rulebook query is already complete. For example, “Get Warboss Toughness and explain Advance.”
+- **Dependent retrieval**: SQL facts determine the rulebook query. For example, “Get Warboss abilities and explain their referenced Core Rules.”
+
+Dependent retrieval uses at most one model call to refine the rulebook query from returned SQL evidence.
+
+SQL clarification stops both cases. SQL empty, error, or unsupported results stop dependent retrieval. Independent rulebook retrieval can continue and provide partial evidence.
+
+### Evidence Status and Context Limits (`agent/graph.py`, `agent/response.py`)
+
+The application combines source results into an evidence status. It distinguishes complete evidence, partial evidence, empty searches, clarification, unsupported requests, and failures.
+
+`ok` means the requested sources returned data. It does not measure semantic correctness.
+
+Model context is bounded:
+
+- SQL: at most 50 rows within 32 KiB.
+- Rulebook answers: at most five complete chunks within 32 KiB.
+
+SQL refinement uses the same SQL context limits. Whole rows or chunks are removed when necessary. Original retrieval results remain available, and context clipping is recorded separately from retrieval truncation.
+
+### Answer Generation and Citations (`agent/response.py`)
+
+`respond` makes one structured model call using the current question, supplied evidence, source statuses, and limitations. It generates the reply in the user's language.
+
+Factual answers use this turn's evidence. Rulebook chunks receive references such as `[R1]`; the SQL result receives `[S1]`.
+
+The application validates citation IDs and maps them to original chunks or this turn's SQL result. Citation validation checks reference validity; semantic support still requires evaluation.
+
+The application computes the final outcome. Partial evidence, clipped answer context, reported insufficient evidence, or missing citations for required source types prevent a `completed` outcome.
+
+The outer workflow normally uses two model calls: planning and response. Dependent `both` adds one refinement call. SQL retriever calls are additional.
+
+### Conversation Memory (`agent/state.py`, `agent/response.py`)
+
+Memory stores conversational scope: entity names and IDs, topic, and filtering conditions.
+
+The response call can propose up to eight updates. User-derived values must appear verbatim in the current input. SQL-derived identities must match unique values from recognized columns in an untruncated result.
+
+Statistics, rule text, and previous answers are excluded from scope memory. Each value records its source turn. Changing an entity name or ID clears an unmatched identity partner.
+
+Memory updates use the response call; there is no separate memory-extraction call.
+
+### Sessions and Runtime Dependencies (`agent/graph.py`, `agent/nodes.py`)
+
+Reusing the graph and `thread_id` continues a session. A new `thread_id` isolates conversation state.
+
+`InMemorySaver` stores checkpoints within the process. Committed history is limited to 8 full turns within an approximate 5,000-token budget.
+
+`EvidenceContext` carries clients, model configuration, retrievers, and callbacks outside checkpointed state. Pass it to every graph invocation. Reusing it also reuses the lazily loaded rulebook retriever.
+
+Clients and retrievers can be injected for testing.
+
+### Commits and Failure Handling (`agent/response.py`, `agent/runtime.py`)
+
+`finalize` commits a complete user/assistant pair and validated memory updates together. Stable message IDs prevent duplicate messages when the same commit is repeated.
+
+Completed, partial, clarification, and unsupported replies can enter committed history. Failed or cancelled drafts do not.
+
+Direct graph calls propagate model failures and validation errors while retaining the last successful checkpoint. Agent nodes are not retried automatically.
+
+`run_turn` converts exceptions and cancellation into terminal results and records trace events. Cancellation may wait for an in-flight synchronous model call to return.
+
 
 ## CLI and Local Graph Traces
 
