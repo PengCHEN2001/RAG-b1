@@ -217,6 +217,7 @@ def validate_combined(
     *,
     sql_ids: set[str],
     rulebook_ids: set[str],
+    rulebook_chunk_ids: set[str],
     path: Path = COMBINED_PATH,
 ) -> set[str]:
     identifiers = _validate_ids(cases, path, r"combined_\d{3}")
@@ -228,6 +229,7 @@ def validate_combined(
         "required_sources",
         "sql_reference_case_ids",
         "rulebook_reference_case_ids",
+        "rulebook_reference_chunk_ids",
         "reference_answer",
         "review_status",
     }
@@ -246,6 +248,12 @@ def validate_combined(
             raise _error(path, case_id, "sql_reference_case_ids must be non-empty")
         if not _string_list(case["rulebook_reference_case_ids"]):
             raise _error(path, case_id, "rulebook_reference_case_ids must be non-empty")
+        if not _string_list(case["rulebook_reference_chunk_ids"]):
+            raise _error(path, case_id, "rulebook_reference_chunk_ids must be non-empty")
+        if len(set(case["rulebook_reference_chunk_ids"])) != len(
+            case["rulebook_reference_chunk_ids"]
+        ):
+            raise _error(path, case_id, "rulebook_reference_chunk_ids must not repeat IDs")
 
         missing_sql = sorted(set(case["sql_reference_case_ids"]) - sql_ids)
         missing_rulebook = sorted(set(case["rulebook_reference_case_ids"]) - rulebook_ids)
@@ -254,6 +262,15 @@ def validate_combined(
         if missing_rulebook:
             raise _error(
                 path, case_id, f"unknown Rulebook references: {', '.join(missing_rulebook)}"
+            )
+        missing_chunks = sorted(
+            set(case["rulebook_reference_chunk_ids"]) - rulebook_chunk_ids
+        )
+        if missing_chunks:
+            raise _error(
+                path,
+                case_id,
+                f"unknown Rulebook reference chunks: {', '.join(missing_chunks)}",
             )
         if not _non_empty_string(case["reference_answer"]):
             raise _error(path, case_id, "reference_answer must be a non-empty string")
@@ -273,11 +290,17 @@ def load_benchmarks(dataset_dir: Path = DATASET_DIR) -> BenchmarkDatasets:
     combined = load_jsonl(combined_path)
 
     rulebook_ids = validate_rulebook(rulebook, rulebook_path)
+    rulebook_chunk_ids = {
+        context["chunk_id"]
+        for case in rulebook
+        for context in case["reference_contexts"]
+    }
     sql_ids = validate_text2sql(text2sql, text2sql_path)
     combined_ids = validate_combined(
         combined,
         sql_ids=sql_ids,
         rulebook_ids=rulebook_ids,
+        rulebook_chunk_ids=rulebook_chunk_ids,
         path=combined_path,
     )
 

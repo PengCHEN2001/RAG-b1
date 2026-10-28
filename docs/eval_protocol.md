@@ -317,6 +317,11 @@ second duplicate dataset. Expected routes are derived from the dataset purpose:
 Router performance is reported using Accuracy, Macro-F1, per-route Precision
 and Recall, and a confusion matrix.
 
+A combined case records both the originating Rulebook case and the exact
+`rulebook_reference_chunk_ids` needed to answer its Rulebook part. Retrieval is
+scored only against those exact chunks, rather than every chunk cited by the
+broader originating Rulebook case.
+
 A combined case is successful only when the Router selects `both`, both
 Retrievers are actually called, the SQL result matches its referenced SQL case,
 all required Rulebook reference chunks are retrieved, the completed answer cites

@@ -156,7 +156,11 @@ def _score(
         score = score_sql_case(case, sql_result, latency_ms=actual.get("duration_ms"))
         return score, route_correct and bool(score["result_correct"])
     sql_cases = {item["case_id"]: item for item in benchmarks.text2sql}
-    rulebook_cases = {item["case_id"]: item for item in benchmarks.rulebook}
+    rulebook_contexts = {
+        context["chunk_id"]: context
+        for item in benchmarks.rulebook
+        for context in item["reference_contexts"]
+    }
 
     sql_result = actual.get("sql_result")
     sql_scores = [
@@ -166,9 +170,8 @@ def _score(
     sql_correct = bool(sql_scores) and all(score["result_correct"] for score in sql_scores)
 
     reference_contexts = [
-        context
-        for case_id in case["rulebook_reference_case_ids"]
-        for context in rulebook_cases[case_id]["reference_contexts"]
+        rulebook_contexts[chunk_id]
+        for chunk_id in case["rulebook_reference_chunk_ids"]
     ]
     rulebook_score = score_rulebook_case(
         {"case_id": case["case_id"], "reference_contexts": reference_contexts},

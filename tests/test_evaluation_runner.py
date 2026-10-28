@@ -48,12 +48,12 @@ class EvaluationRunnerTests(unittest.TestCase):
                 "columns": sql_case["expected_columns"],
                 "rows": sql_case["expected_rows"],
             }
-            reference_ids = set(case["rulebook_reference_case_ids"])
+            reference_ids = set(case["rulebook_reference_chunk_ids"])
             rulebook_results = [
                 {"chunk": {"chunk_id": context["chunk_id"], "text": context["text"]}}
                 for item in self.datasets.rulebook
-                if item["case_id"] in reference_ids
                 for context in item["reference_contexts"]
+                if context["chunk_id"] in reference_ids
             ]
         combined = dataset == "combined"
         return {
@@ -236,6 +236,31 @@ class EvaluationRunnerTests(unittest.TestCase):
         self.assertTrue(all(
             record["deterministic"]["sql_result_correct"] for record in records
         ))
+
+    def test_combined_scores_only_its_exact_rulebook_evidence(self):
+        paths = run_evaluation(
+            selection="combined",
+            output_root=self.output,
+            run_id="combined-exact-rulebook-evidence",
+            model="test-model",
+            use_ragas=False,
+            judge_model="judge-model",
+            embedding_model="embedding-model",
+            executor=self.successful_result,
+            datasets=self.datasets,
+        )
+
+        records = [json.loads(line) for line in paths.raw_results.read_text().splitlines()]
+        scoring = {record["case_id"]: record["deterministic"] for record in records}
+        self.assertTrue(all(record["benchmark_passed"] for record in records))
+        self.assertEqual(
+            scoring["combined_002"]["rulebook_reference_score"]["reference_chunk_count"],
+            1,
+        )
+        self.assertEqual(
+            scoring["combined_002"]["rulebook_reference_score"]["recall_at_k"],
+            1.0,
+        )
 
     def test_invalid_dataset_is_retained_as_invalid_case(self):
         with patch(

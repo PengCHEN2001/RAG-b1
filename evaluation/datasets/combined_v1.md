@@ -14,6 +14,7 @@ The current version contains two manually reviewed questions. Both reuse evidenc
 
 - SQL: `sql_003`
 - Rulebook: `rb_001`
+- Required Rulebook chunk: `core-rules-grenade-001-001`
 
 **Reference answer:**
 
@@ -31,6 +32,7 @@ Yes. An Imperial Space Marine has the Grenades keyword. The Grenade Stratagem co
 
 - SQL: `sql_008`
 - Rulebook: `rb_003`
+- Required Rulebook chunk: `core-rules-capture-and-control-001-001`
 
 **Reference answer:**
 
