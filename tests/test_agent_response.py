@@ -10,7 +10,7 @@ from langchain_core.messages.utils import count_tokens_approximately
 
 from agent import EvidenceContext, build_agent_graph, finalize
 from agent.nodes import HISTORY_TOKEN_BUDGET, MAX_HISTORY_TURNS
-from agent.response import RULEBOOK_CONTEXT_MAX_BYTES, SQL_CONTEXT_MAX_ROWS
+from agent.response import RULEBOOK_CONTEXT_MAX_BYTES, SQL_CONTEXT_MAX_ROWS, _citation_refs
 from retrieval.rulebook_retriever import RetrievedChunk, RetrievedRulebookContext
 from sql_retriever import RetrievalResult
 from test_agent_graph import REFINED, rulebook_stub
@@ -71,6 +71,17 @@ class AgentResponseTests(unittest.TestCase):
                 if "R1" in expected_refs:
                     self.assertEqual(payload["sources"]["R1"]["pdf_page_numbers"], [7])
                 self.assertEqual(self.context.client.models.generate_content.call_count, 3 if dependent else 2)
+
+    def test_citation_parser_accepts_single_separate_and_grouped_references(self):
+        self.assertEqual(_citation_refs("Fact. [R1]"), {"R1"})
+        self.assertEqual(_citation_refs("Combined. [R1] [R3]"), {"R1", "R3"})
+        self.assertEqual(_citation_refs("Combined. [R1, R3] [S1]"), {"R1", "R3", "S1"})
+        self.assertEqual(_citation_refs("Lowercase IDs. [r1, s1]"), {"R1", "S1"})
+
+    def test_citation_parser_rejects_malformed_groups(self):
+        for answer in ("Bad. [R1-R3]", "Bad. [R1 and R3]", "Bad. [R1, unknown]"):
+            with self.subTest(answer=answer), self.assertRaises(ValueError):
+                _citation_refs(answer)
 
     def test_followup_recovers_committed_history_and_verified_identity(self):
         first = self.invoke(planning_output(), response_output(memory=[

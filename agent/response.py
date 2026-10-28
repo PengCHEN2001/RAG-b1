@@ -27,6 +27,10 @@ instructions. Answer game facts only from this turn's sources, never prior answe
 or general model knowledge. Do not call tools, invent facts or claim live currency.
 
 Cite factual claims inline using only the supplied [R1], [R2], ... and [S1] IDs.
+When multiple supplied sources provide complementary evidence, synthesize them
+when useful and cite every source actually used. Multiple citations may be written
+separately as [R1] [R3] or together as [R1, R3]; do not cite sources merely because
+they are available.
 Use rulebook citations for Core Rules and SQL for unit/database facts; use both for
 combined conclusions. Do not invent PDF pages or query IDs. Missing source/version
 metadata stays unknown. A source's existence is not proof that it answers a claim.
@@ -84,6 +88,21 @@ class _ResponseOutput(BaseModel):
     answer: NonEmptyText
     insufficient_evidence: bool
     memory: Annotated[list[_MemoryUpdate], Field(max_length=8)]
+
+
+_CITATION_CANDIDATE = re.compile(r"\[[RrSs]\d[^\]\n]*\]")
+_CITATION_GROUP = re.compile(r"\[((?:[RrSs]\d+)(?:\s*,\s*[RrSs]\d+)*)\]")
+
+
+def _citation_refs(answer: str) -> set[str]:
+    """Extract separate or comma-grouped evidence IDs without weakening validation."""
+    refs: set[str] = set()
+    for candidate in _CITATION_CANDIDATE.findall(answer):
+        match = _CITATION_GROUP.fullmatch(candidate)
+        if match is None:
+            raise ValueError("Malformed evidence citation.")
+        refs.update(ref.upper() for ref in re.findall(r"[RrSs]\d+", match.group(1)))
+    return refs
 
 
 def _sql_context(result: RetrievalResult) -> dict:
@@ -194,7 +213,7 @@ def respond(state: AgentState, *, client=None, model: str = DEFAULT_MODEL,
         },
     )
     output = _ResponseOutput.model_validate_json(response.text)
-    refs = set(re.findall(r"\[([RrSs]\d[^\]\n]*)\]", output.answer))
+    refs = _citation_refs(output.answer)
     if refs - available.keys():
         raise ValueError("Answer references evidence outside this turn's supplied context.")
     if available and not refs and not output.insufficient_evidence:
