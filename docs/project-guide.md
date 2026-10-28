@@ -4,6 +4,31 @@
 
 RAG-b1 is a Warhammer 40K question-answering project using a core rulebook PDF and SQLite unit data through a LangGraph agent, with CLI / Textual TUI interfaces and local graph traces.
 
+## System Architecture
+
+```text
+User question
+      │
+      ▼
+Planner / Router (Gemini)
+      │
+      ├── Rulebook question ──► Rulebook Retriever
+      ├── Database question ──► SQL Retriever
+      ├── Combined question ──► SQL Retriever + Rulebook Retriever
+      └── Direct, clarification or unsupported request
+      │
+      ▼
+Collected evidence and source status
+      │
+      ▼
+Answer generation with citations
+      │
+      ▼
+CLI / TUI response and structured trace
+```
+
+The following sections describe the Rulebook pipeline, SQL Retriever and Agent workflow in more detail.
+
 ## Project Structure
 
 ```text
@@ -75,6 +100,7 @@ Docling parser
       └── PNG images + manifest
 ```
 
+
 - JSON preserves the document structure and will be used for chunking.
 - Markdown is used only for reading and checking the parsed content.
 - Pictures are saved separately as PNG files.
@@ -82,19 +108,19 @@ Docling parser
 - OCR is optional because the PDF already contains a text layer.
 - Parsing does not use an LLM.
 
-The parser also provides a LangChain page adapter. Missing files and incomplete conversions produce clear errors.
+The parser also exposes a LangChain-compatible page adapter and reports missing or incomplete conversion outputs clearly.
 
 The processed files are saved in `data/processed/`: `Core Rules.json`, `Core Rules.md`, PNG images, and `images/Core Rules/manifest.json`. The current conversion processed 60 pages and exported 148 images.
 
 ### Documented visual-text correction
 
-The project currently follows a text-first RAG strategy. Extracted images and their page references are retained for provenance, but full PDF page images are not sent to Gemini at query time. This avoids the additional image-input tokens, latency, and implementation complexity of multimodal generation.
+Our RAG pipeline currently works with text chunks, so PDF images are not sent to Gemini during a query. Sending page images for every request would increase token use and latency, while manually describing every image would also require substantial work.
 
-For a verified visual element that directly affects the meaning of a rule, the project uses a scoped visual-to-text normalisation. On page 42, the Grenade Stratagem displays its `1CP` cost in a graphical label beside the rule block. Docling extracted the main rule text but did not preserve the spatial relation between that label and the Grenade section, so the production chunk represents the visible label as `COST: 1CP` before indexing.
+We therefore tested a smaller approach on one verified visual detail. On page 42, the Grenade Stratagem has a `1CP` label next to its rule text. Docling extracts the label and the rule text, but does not connect them. We converted this visual information into the text `COST: 1CP` and added it to the Grenade chunk before indexing.
 
-This source-backed correction is recorded in `data/processed/Core Rules.corrections.json`. The chunker automatically loads a correction file with the same stem as its input JSON, validates the target chunk and PDF page, and then applies the documented text insertion. The correction restores information visible on PDF page 42; it does not add a rule that is absent from the source or modify evaluation references only.
+The correction is stored in `data/processed/Core Rules.corrections.json` and is applied again whenever chunks are rebuilt. The Grenade test shows that this text representation can be retrieved and used in the final answer.
 
-The benchmark verifies that this searchable text representation supports the expected answer. This demonstrates the feasibility of selective visual-to-text normalisation, but it is not presented as a general image-understanding solution. A future layout-aware extractor could associate all Stratagem cost icons automatically.
+This does not replace image retrieval. It only shows that important visual details can be added to a text-first RAG pipeline in a simple and reproducible way.
 
 ## Chunking Design
 
@@ -107,6 +133,8 @@ Implemented in `ingestion/chunker.py`.
 - Use document-aware recursive splitting only when a logical unit is too long: target 300–400 BGE tokens, maximum 450 tokens, split at paragraph or sentence boundaries, with a 60-token overlap only between parts of the same long unit.
 - Output: `data/processed/Core Rules.chunks.jsonl`. The current rulebook produces 212 chunks.
 - If `<input stem>.corrections.json` exists, apply and validate those documented visual-to-text corrections before writing the final chunk file.
+
+Rules are kept by section because a heading, its conditions and its effect often need to be read together. The 300–400-token target keeps most rules intact while avoiding overly broad chunks in retrieval and answer prompts. A 450-token limit prevents very long sections from bringing unrelated material into the context. The 60-token overlap is used only when one long section must be split, so boundary information is retained without duplicating the whole corpus.
 
 Each chunk stores:
 
@@ -123,25 +151,27 @@ picture_ids, image_paths, token_count
 
 Implemented in `ingestion/build_index.py`.
 
-- Model: local `BAAI/bge-base-en-v1.5`.
-- Rationale: English rulebook, no API key or online cost, and 768-dimensional vectors suitable for the project.
-- Input: each chunk's section context and text.
-- Vectors are L2-normalised. A content hash cache avoids re-embedding unchanged chunks; changing either the chunk text or model creates new embeddings.
+The embedding model is the local `BAAI/bge-base-en-v1.5`. It is a general-purpose English retrieval model, which fits the English Rulebook and the expected user questions. It provides good semantic retrieval quality while remaining small enough to run locally on our hardware. Using a local model also avoids an embedding API key, online cost and network dependency when rebuilding the index.
+
+Each embedding contains the chunk text and its section context. The model produces 768-dimensional vectors, which are L2-normalised before being stored in Chroma. A content-hash cache avoids re-embedding chunks that have not changed; changing either the chunk text or the model creates new embeddings.
 
 ## Dense and Keyword Index Design
 
-Implemented in `ingestion/build_index.py` from the same `Core Rules.chunks.jsonl` file.
+Implemented in `ingestion/build_index.py`.
 
-- Dense index: ChromaDB `PersistentClient` stores chunk ID, text, filterable metadata, and its 768-dimensional vector in `data/indexes/core_rules/chroma/`.
-- Keyword index: `rank_bm25` creates `data/indexes/core_rules/bm25.pkl`; `bm25_chunk_ids.json` maps each BM25 position back to the same chunk ID.
-- `index_manifest.json` records the chunk file hash, chunk count, embedding model, vector dimension, and Chroma collection name.
-- The two indexes are queried together and combined with hierarchical Reciprocal Rank Fusion (RRF) for hybrid retrieval. BM25 is stored beside Chroma, not inside it.
+After embedding the Rulebook chunks, the system builds two indexes from the same `Core Rules.chunks.jsonl` file:
 
-The parsed JSON, readable Markdown, final chunks, and correction file are
-committed so the submitted repository includes the parsed Rulebook data.
-Extracted PNG images and `data/indexes/` are larger rebuildable artifacts and
-remain local; `make prepare` regenerates them and rebuilds both indexes from the
-committed PDF and processing code.
+- **Dense index:** ChromaDB `PersistentClient` stores each chunk ID, text, filterable metadata and 768-dimensional embedding in `data/indexes/core_rules/chroma/`.
+- **Keyword index:** `rank_bm25` creates `data/indexes/core_rules/bm25.pkl`. The accompanying `bm25_chunk_ids.json` file maps each BM25 result back to its chunk ID.
+- **Index manifest:** `index_manifest.json` records the chunk-file hash, chunk count, embedding model, vector dimension and Chroma collection name. This lets the project detect when an index no longer matches the current chunks.
+
+Dense retrieval helps when a user asks about a rule in different words from the Rulebook, while BM25 is useful for exact game terms, unit names, numbers and short rule phrases. The Rulebook Retriever uses both indexes; its fusion and reranking steps are described in the next section.
+
+## Reproducible Rulebook Build
+
+The parsed JSON, readable Markdown, final chunks and correction file are committed to the repository. Extracted PNG images and retrieval indexes are larger rebuildable artifacts, so they remain local.
+
+Running `make prepare` regenerates the images and both indexes from the committed PDF, processing code and correction file. This keeps the submitted Rulebook pipeline reproducible without committing large generated files.
 
 ## Rulebook Retriever Design
 
@@ -261,7 +291,13 @@ first prevents the Dense modality from receiving two votes against each BM25
 route. The original-query BM25 route preserves exact user terminology, while
 keyword BM25 supplies canonical rule terms selected by the Router.
 
-The current reranker is `cross-encoder/ms-marco-MiniLM-L6-v2`. It is a small English cross-encoder, suitable for reranking only 12 candidates from the English rulebook on a local student laptop. If future evaluation requires stronger semantic ranking or multilingual query support, it can be replaced with, like the larger `Qwen/Qwen3-Reranker-0.6B`; that model requires substantially more local storage and memory.
+RRF combines ranking positions rather than raw retrieval scores because Chroma similarity scores and BM25 scores use different scales. Chunks that appear near the top of several rankings receive stronger support in the fused result.
+
+We retained a Dense search on the original question after manual checks showed that a planner rewrite can narrow broad questions. For example, a broad question about scoring can be rewritten into a query focused only on objective-marker scoring. The unchanged question acts as a recall safeguard, while the inner RRF prevents Dense retrieval from receiving extra weight in the outer fusion.
+
+The reranker is `cross-encoder/ms-marco-MiniLM-L6-v2`. It is a small English cross-encoder that can rerank 12 Rulebook candidates locally on a student laptop. This gives more precise final ranking without requiring a large local model or another API call.
+
+The Retriever returns only the final five chunks to the answer layer. This keeps the generation context focused on the strongest evidence and limits prompt size, latency and token use. Retaining more candidates may improve recall in some cases, but also increases the risk that loosely related rules distract the answer model.
 
 ## SQL Retriever Design
 
