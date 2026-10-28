@@ -346,9 +346,9 @@ Question
                               -> Structured result
                               -> Downstream answer generation
 ```
-
-Fixed requests normally use one model call. Generated requests use two, or three if SQL repair is needed. 
-Answer generation is a separate call.
+Since LLM generated SQL queries are limited in terms of stability, reproducibility and security,
+we prioritize predefined SQL template functions over generation. 
+Only questions out of the scope of fixed functions will be routed to generation.
 
 Both routing and SQL generation receive the complete data dictionary. 
 It describes available tables, columns, and relationships.
@@ -433,7 +433,7 @@ Fixed queries, generated queries, and entity lookups share one bounded SQLite ex
 It enforces:
 
 - Read-only access.
-- Allowed tables and functions.
+- Allowed tables and functions (a whitelist to avoid breaking the database).
 - One SQL statement per execution.
 - Parameter validation.
 - Execution-time, computation, and result-size limits.
@@ -461,7 +461,9 @@ The retriever returns one of five statuses:
 
 Results include applicable rows, columns, SQL, parameters, strategy, clarification candidates, and truncation or error information.
 
-The downstream answer layer uses this evidence to generate an answer with source references. It preserves clarification choices and explains missing or truncated evidence. An empty result means the query found no matching evidence; truncated results support only partial conclusions.
+The downstream answer layer uses this evidence to generate an answer with source references. 
+It preserves clarification choices and explains missing or truncated evidence. 
+An empty result means the query found no matching evidence; truncated results support only partial conclusions.
 
 ## Agent Graphs and Conversation Replies
 
@@ -587,59 +589,81 @@ Direct graph calls propagate model failures and validation errors while retainin
 
 `run_turn` converts exceptions and cancellation into terminal results and records trace events. Cancellation may wait for an in-flight synchronous model call to return.
 
+## CLI/TUI and Usage Monitoring
 
-## CLI and Local Graph Traces
+The CLI and `Textual` TUI share the same agent workflow. They handle input, display results, and expose execution details.
 
-Configure `GOOGLE_API_KEY` in `.env`, provide `data/sql/wahadb.sqlite`, and build the rulebook indexes using the commands below. Run from the project root:
+Both interfaces call `run_turn()` (`agent/runtime.py`) It executes one turn, collects events, records traces, and returns the final result.
 
-```bash
-uv run python -m ui.cli --trace
-uv run python -m ui.cli "Which abilities does Warboss have?" --trace --sources
-uv run python -m ui.cli --inspect data/traces/SESSION/RUN.jsonl --sources
-uv run python -m ui.cli --inspect data/traces/SESSION/RUN.jsonl --json
-```
+### Input and Output (`ui/cli.py`, `ui/tui.py`)
 
-- Omit the question for an interactive session. `/new` starts isolated memory and deletes the old thread's in-memory checkpoints; it keeps its trace files. `/sources` displays all cited sources, `/sources S1` one source, `/trace` toggles live step display, and `/quit` or EOF exits. Ctrl-C at the prompt exits; during a turn it records cancellation and returns to the prompt. Single-question error/cancellation exits with status 1/130; other outcomes return 0.
-- Answers and requested source JSON go to stdout; progress, route, source status/count, session/run/turn IDs, SQL strategy, outcome, total latency and trace path go to stderr. Steps and route reasons are shown with `--trace`. Replies currently appear as whole messages, without token streaming.
-- Disk tracing is on even when live step display is off. `--no-trace` disables files and can be combined with `--trace` for display only. `--trace-dir PATH` selects another local directory. No transcript is loaded into a new process automatically.
-- `agent.runtime.run_turn(graph, context, *, session_id, question, trace_dir=..., on_event=None, cancel_event=None)` is shared by the CLI and TUI. It consumes LangGraph's native `tasks` and `custom` streams, issues fresh run IDs, and sends the same redacted event records to the callback and JSONL writer. Keep a graph/context and session ID for follow-ups; use caller-generated internal session IDs, not arbitrary paths. `cancel_event` accepts a `threading.Event` for cooperative cancellation between graph events and SDK calls.
-- Each run writes `data/traces/<session_id>/<run_id>.jsonl`, with a `session.json` manifest containing creation time, model, Python/LangGraph versions, lock-file hash and working-source hash. The code hash identifies changes but does not retain a runnable code snapshot; data/index fingerprints and historical environments are not captured yet. Scope is graph events plus observed LLM SDK calls/usage; full model requests and retriever internals remain unavailable. Existing session manifests describe their creation-time capabilities; each run's events and summary describe its actual usage coverage.
-- Events contain schema version, session/run IDs, sequence, UTC timestamp, event/node, span and parent IDs. They cover `run.started`, node `step.started/finished/failed`, `route.selected`, `query.refined`, `retrieval.completed`, LLM start/wait/retry/finish/failure events, and exactly one `run.finished` for a controlled turn. Node starts snapshot their actual State input; finishes snapshot updates, including history trimming/overwrite, planned queries, bounded retriever results, PDF metadata, SQL provenance, answer, citations and memory commits. These are **graph-node** inputs, not a recording of the exact model HTTP requests.
-- Durations use a monotonic clock and measure observed node lifecycles, including stream/trace/display overhead; run time includes cold model initialization, throttle waits and retry backoff. Each LLM attempt records its observed SDK-call duration, including retries internal to that SDK invocation; application-level retry attempts have separate call IDs. SQL's non-LLM internal phases, raw model outputs, repair SQL before/after snapshots and rulebook intermediate candidate rankings remain unavailable.
-- The writer flushes each complete JSON line. It does not promise power-loss durability. Write/open/close failures emit a visible `trace.failed` warning and mark the returned trace incomplete while preserving a valid answer. Error records retain exception type, validation locations and stack file/function/line locations, omitting raw provider messages, locals and source lines. Known configured API keys and credential fields are redacted; SDK clients and authentication headers are never serialized from runtime context.
-- `--inspect` reads saved records without building/resuming a graph or calling a model/SQL. It shows lifecycle, route and result; `--sources` resolves actual cited chunks or executed SQL, bindings, full bounded rows and separate prompt-clipping flags. `--json` exposes full recorded node snapshots. An incomplete final JSON fragment is skipped with a warning; a run without `run.finished` is `interrupted`. Corrupt middle records or mixed run IDs/sequence are rejected. This is replay of recorded facts, not a rerun of the original experiment.
+The CLI supports a single command-line question or an interactive session. The TUI accepts questions through an input field.
+Both ignore empty interactive input and handle `/new`, `/sources [ID]`, `/trace`, and `/quit` locally.
 
-The lower-level graph still propagates exceptions. The runner's returned outcome is authoritative for failed/cancelled turns: its returned State copy clears answer/citations; the underlying checkpoint retains the last successful node for debugging. Cancellation does not forcibly terminate synchronous provider/model calls; it may wait for an in-flight call to return before the stream stops. No new turn is submitted during that wait. Once `finalize` starts, the memory commit completes and the committed outcome wins over a late cancellation. Automatic checkpoint rotation for long sessions and detailed retriever instrumentation remain pending.
+- `/new` starts a fresh session, deletes the old in-process checkpoints;
+- `/sources [ID]` opens sources with the corresponding ID;
+- `/trace` toggles live step output in the CLI and the Inspector in the TUI;
+- `/quit` stops the session and quits the application.
 
-### Textual TUI
+The CLI writes answers and requested source JSON to `stdout`. 
+Prompts, progress, errors, and run summaries go to `stderr`.
+The TUI displays Markdown answers in the chat and execution details in the Inspector. 
 
-```bash
-uv run python -m ui.tui
-uv run python -m ui.tui --model gemini-3.5-flash-lite
-uv run python -m ui.tui --inspect data/traces/SESSION/RUN.jsonl
-```
+### Background Execution and Input Control (`ui/tui.py`)
 
-`ui/tui.py` uses a Textual thread worker to call the same runner as the CLI. Only redacted trace messages cross into the UI through thread-safe `post_message`; stdout/stderr output is not parsed. One turn runs at a time. Input, New and the turn selector are disabled until the worker returns. Esc requests cancellation; Ctrl+Q requests cancellation and quits after the worker returns.
+The TUI runs the synchronous runner in a Textual thread worker.
 
-The chat is paired with an inspector showing session/run/turn/model, route and `both` dependency, observed step/total timings, SQL strategy/row count, rulebook count, clipping indicators, trace status and failed node. LLM child rows show each actual SDK call; metadata shows per-turn and session calls/tokens/coverage. Select a turn to load its retained JSONL on demand; Enter on a step opens its complete redacted input/output in Payload. Select `run.finished` for the complete final state, usage breakdown, error/stack locations, context and clarification metadata. Sources resolves cited SQL/parameters/rows and rulebook chunk IDs/pages/text/scores through `source_details`. The inspector can be toggled with Ctrl+T or `/trace`; below 100 columns it replaces the chat view. Ctrl+S or `/sources [ID]` opens sources.
+Only one turn runs at a time. A `busy` state disables question input, session reset, and history selection until execution ends. The interface remains responsive for inspection and cancellation.
 
-`/new` starts a fresh session, deletes the old in-process checkpoints and clears the UI's run list, while retaining disk traces. The chat rendering buffer is limited to 1,000 lines; only the selected run's full events/state are retained in UI memory. `--no-trace` keeps current inspection but disables access to earlier turn details. `--inspect` is read only: it creates no graph/client and executes no model or SQL calls. It also displays interrupted traces and reader warnings. Live replies appear as complete answers; no answer-token streaming or retriever-internal timings are implied.
+### Cross-Thread Communication (`agent/runtime.py`, `ui/tui.py`)
 
-Headless UI tests use Textual's `run_test`/Pilot with `unittest.IsolatedAsyncioTestCase`, real graph orchestration and offline model/retriever stubs; no real API calls are required. See [Textual workers](https://textual.textualize.io/guide/workers/) and [testing](https://textual.textualize.io/guide/testing/).
+Node threads place LLM events in a `SimpleQueue`. The runner owns event numbering, statistics, and trace writes.
 
-### LLM calls and provider token usage
+The worker sends trace events and completion results through thread-safe `post_message()`. UI handlers update widgets. Business state comes from structured events rather than parsed terminal output.
 
-`llm/instrumentation.py` is the shared boundary for application Gemini calls. Plan, dependent rulebook-query refinement, response generation, SQL routing/generation/repair and the legacy fixed-function entry all use it. The boundary applies a process-wide minimum interval between real SDK calls so independent graph nodes cannot collectively exceed the free-tier rate too quickly. This deliberately trades evaluation and chat throughput for fewer provider-side failures; injected offline clients are not delayed.
+### Thread Coordination, Cancellation, and Exit (`ui/tui.py`, `agent/runtime.py`)
 
-The default interval is five seconds. Temporary `429`, `500`, `502`, `503`, `504`, and SDK `ServerError` failures use bounded exponential retries, with three total attempts and a five-second base delay by default. `GEMINI_MIN_INTERVAL_SECONDS`, `GEMINI_MAX_ATTEMPTS`, and `GEMINI_RETRY_BASE_SECONDS` override these values; an interval of zero disables pacing. Permanent client, authentication, model, validation and policy failures are not blindly retried. Throttling reduces free-tier rate pressure but cannot guarantee availability when Google is overloaded or a daily quota is exhausted.
+The TUI gives `tqdm` a thread `RLock` to avoid incompatibility between its default process lock and Textual's captured `stderr`.
 
-Each actual SDK attempt emits `llm.started` and one `llm.finished`/`llm.failed`, with a unique call ID parented to its graph node. Rate-limit waits emit `llm.waiting`, and a recoverable provider failure emits `llm.retrying`; the CLI and TUI display both instead of appearing frozen. Events retain purpose, attempt number, requested model, provider, monotonic duration, response ID/model version when supplied, and usage. Provider error text, credentials, prompts and raw responses are not copied into LLM metadata events. Usage is captured before JSON/citation validation, so invalid structured output still counts. `llm_calls` counts SDK invocations including failed retry attempts; it does not claim to count HTTP retries hidden inside one SDK invocation or evaluation-judge calls.
+A separate `Event` carries cancellation requests. Esc requests cancellation; Ctrl+Q requests cancellation followed by exit.
 
-Provider usage preserves nullable `prompt_token_count`, `candidates_token_count`, `thoughts_token_count`, `cached_content_token_count`, `tool_use_prompt_token_count` and `total_token_count`. Values are reported, never estimated; cached tokens are not added to prompt tokens and the provider's total is not reconstructed from a formula. API errors or an absent usage response have `usage: null` at the call level. A missing field stays null; an explicitly reported zero stays zero.
+An active synchronous call may need to return before execution stops. New input remains disabled during that wait. Once `finalize` starts, its commit completes and takes precedence over a late cancellation.
 
-`run.finished` and the runner result expose `llm_calls` and a `usage` summary. Each token total is null unless every observed call reports that field and the instrumented scope is complete. `known_totals` holds only reported subtotals, `reported_calls` gives coverage per field, and `total_calls` is the observed-call denominator. `complete` requires complete prompt/candidate/total coverage; optional thinking/cache/tool fields may remain null. A question-only injected SQL callable is opaque when executed: `instrumentation_complete=false` marks that boundary, while retaining counts and known usage from instrumented calls. There are no usage counters in checkpointed `AgentState` or future prompts.
+### Failures and Recovery (`ui/cli.py`, `ui/tui.py`, `agent/runtime.py`)
 
-CLI/TUI also reduce run summaries into session totals, keyed by run ID; history selection never adds the same run again. `/new` resets totals. `--no-trace` still records live statistics in memory. Old traces stay unavailable and are not estimated from node counts. Evaluation's trace adapter passes through the same fields. During cancellation the runner waits for in-flight work and drains retained LLM events before writing `run.finished`, preserving any returned usage even when no answer is committed. A killed process can leave only `llm.started`; its consumed tokens remain unknown.
+The runner returns error or cancellation status with diagnostics. Failed drafts do not enter committed conversation history.
+
+The TUI restores input after completion or an unexpected worker error. The interactive CLI returns to the prompt after a failed or cancelled turn. Single-question CLI execution returns exit code `1` for errors and `130` for cancellation.
+
+### Traces and Source Inspection (`agent/runtime.py`, `ui/cli.py`, `ui/tui.py`)
+
+Live display and disk-stored tracing are independent. 
+`--no-trace` disables trace files while preserving current-run inspection and statistics.
+Trace write failures produce a warning while preserving a valid answer.
+
+Source inspection shows cited SQL, parameters, rows, and rulebook chunks. 
+`--inspect` reads saved records without executing the graph, model, or SQL.
+
+### Token Usage Monitoring (`llm/instrumentation.py`, `agent/runtime.py`)
+
+Token usage is collected from SDK responses, aggregated per turn, and accumulated per session.
+
+The shared `generate_content()` wrapper reads `usage_metadata`. It preserves provider-reported input, output, thinking, cached, tool-related input, and total token counts. 
+Totals are taken directly from the provider; cached tokens are not added again.
+
+Each SDK attempt receives a unique `call_id`, including retry attempts. The runner aggregates call events into a turn summary. 
+Usage is captured before response validation, so a later validation failure or cancellation still retains any returned usage.
+
+Only an explicitly reported zero value will be noted as `0`, missing usage remains `null`. 
+A field receives a complete total only when every observed call reports it and the instrumented scope is complete. 
+Otherwise, `known_totals` preserves reported subtotals and `reported_calls` records coverage.
+
+For example, if two of three calls report 300 tokens combined, the total is `null`, the known subtotal is 300, and coverage is `2/3`.
+
+The CLI and TUI display turn and session summaries (`ui/cli.py`, `ui/tui.py`). 
+Session totals use `run_id` to prevent double-counting. `/new` resets them, and `--no-trace` preserves live statistics.
+
+The scope covers observed SDK invocations. Internal HTTP retries are not counted separately. Opaque injected SQL callbacks mark the scope as incomplete.
 
 ## Build and Simple Verification
 
@@ -723,14 +747,3 @@ Each run saves raw results, failed cases and a Markdown report. The full benchma
 
 An [example evaluation report](../evaluation/reports/20261028_173548/report.md) is included as a reference output. It records one complete run, including its configuration and failures; it is not presented as a fixed pass threshold.
 
-## Final Submission Checklist
-
-- confirm that the two member names shown in `README.md` use the preferred spelling;
-- run the complete offline test suite;
-- run the deterministic Rulebook, Text-to-SQL, and combined benchmarks from a
-  committed working tree, then run RAGAS separately if quota permits;
-- manually inspect the two combined answers and the multi-turn acceptance cases;
-- retain one reviewed evaluation report, including failures and configuration,
-  as the final project result;
-- verify the setup and Quick Start with a fresh `GOOGLE_API_KEY`, then send the
-  repository link to the teacher.
