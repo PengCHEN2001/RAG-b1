@@ -279,11 +279,15 @@ the generated SQL does not need to use the same syntax. Two different SQL
 statements are considered equivalent when they return the same correct result.
 
 The comparison normalizes Unicode text, numeric values, and the known database
-encoding issue. It requires the expected result shape and row values, but does
-not reject an otherwise equivalent result only because generated SQL uses a
-different output alias (for example, `model_name` instead of `unit_name`). Exact
-column-name equality is retained as diagnostic information. Row order is ignored
-unless the case explicitly sets `order_sensitive`; duplicate-row multiplicity is
+encoding issue. Before comparing rows, it projects the complete public SQL result
+onto the case's `expected_columns`. Extra metadata such as datasheet IDs,
+descriptions, or invulnerable-save fields is retained in the raw result but does
+not make an otherwise correct answer fail. A small schema-level alias map handles
+equivalent public names such as `weapon_name`/`weapon` and `a`/`attacks`; these
+aliases are not tied to individual case IDs. Every required column must still be
+present and every projected value must match. Exact column-name and column-count
+equality remain available as diagnostic information. Row order is ignored unless
+the case explicitly sets `order_sensitive`; duplicate-row multiplicity is
 preserved.
 
 The reported metrics are:
@@ -318,7 +322,9 @@ Retrievers are actually called, the SQL result matches its referenced SQL case,
 all required Rulebook reference chunks are retrieved, the completed answer cites
 both source types, and the run outcome is `completed`. This prevents a plausible
 answer based on only one source, or a failed SQL object that merely exists, from
-being counted as successful. Because the combined set contains only two cases,
+being counted as successful. Combined SQL evidence uses the same required-column
+projection and strict value comparison as the standalone Text-to-SQL benchmark.
+Because the combined set contains only two cases,
 their final answer correctness remains marked for direct human inspection in
 the final report rather than introducing another small custom LLM judge.
 

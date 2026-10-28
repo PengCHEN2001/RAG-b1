@@ -192,6 +192,51 @@ class EvaluationRunnerTests(unittest.TestCase):
                 self.assertEqual(len(records), 2)
                 self.assertTrue(all(not record["benchmark_passed"] for record in records))
 
+    def test_combined_projects_sql_evidence_from_enriched_results(self):
+        def enriched_executor(dataset, case):
+            result = self.successful_result(dataset, case)
+            if case["case_id"] == "combined_001":
+                result["sql_result"] = {
+                    "status": "ok",
+                    "columns": ["datasheet_name", "keyword", "model", "isFactionKeyword"],
+                    "rows": [
+                        ["Imperial Space Marine", keyword, "", "false"]
+                        for [keyword] in next(
+                            item for item in self.datasets.text2sql
+                            if item["case_id"] == "sql_003"
+                        )["expected_rows"]
+                    ],
+                }
+            elif case["case_id"] == "combined_002":
+                result["sql_result"] = {
+                    "status": "ok",
+                    "columns": [
+                        "datasheet_name", "movement", "toughness", "save",
+                        "wounds", "leadership", "objective_control", "invulnerable_save",
+                    ],
+                    "rows": [["Custodian Guard", "6\"", "6", "2+", "3", "6+", "2", "4"]],
+                }
+            return result
+
+        paths = run_evaluation(
+            selection="combined",
+            output_root=self.output,
+            run_id="combined-enriched-sql",
+            model="test-model",
+            use_ragas=False,
+            judge_model="judge-model",
+            embedding_model="embedding-model",
+            executor=enriched_executor,
+            datasets=self.datasets,
+        )
+
+        records = [json.loads(line) for line in paths.raw_results.read_text().splitlines()]
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(record["benchmark_passed"] for record in records))
+        self.assertTrue(all(
+            record["deterministic"]["sql_result_correct"] for record in records
+        ))
+
     def test_invalid_dataset_is_retained_as_invalid_case(self):
         with patch(
             "evaluation.run.load_benchmarks",

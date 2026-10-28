@@ -125,6 +125,75 @@ class SqlMetricTests(unittest.TestCase):
         self.assertFalse(score["rows_correct"])
         self.assertFalse(score["execution_correct"])
 
+    def test_projects_required_columns_from_enriched_fixed_result(self):
+        case = {
+            "case_id": "sql_002",
+            "expected_status": "ok",
+            "expected_columns": [
+                "weapon", "type", "range", "attacks", "bs_ws", "strength", "ap", "damage"
+            ],
+            "expected_rows": [["Guardian spear", "Ranged", "24", "2", "2", "4", "-1", "2"]],
+            "order_sensitive": False,
+        }
+        actual = {
+            "status": "ok",
+            "columns": [
+                "datasheet_name", "weapon_name", "type", "range", "a", "bsWs", "s", "ap", "d"
+            ],
+            "rows": [[
+                "Custodian Guard", "Guardian spear", "Ranged", "24",
+                "2", "2", "4", "-1", "2",
+            ]],
+        }
+
+        score = score_sql_case(case, actual)
+
+        self.assertFalse(score["columns_correct"])
+        self.assertFalse(score["column_count_correct"])
+        self.assertTrue(score["required_columns_present"])
+        self.assertTrue(score["rows_correct"])
+        self.assertTrue(score["execution_correct"])
+
+    def test_enriched_result_still_fails_when_required_value_is_wrong(self):
+        case = {
+            "case_id": "sql_007",
+            "expected_status": "ok",
+            "expected_columns": ["faction_name"],
+            "expected_rows": [["Space Marines"]],
+            "order_sensitive": False,
+        }
+        actual = {
+            "status": "ok",
+            "columns": ["faction_id", "faction_name"],
+            "rows": [["SM", "Adeptus Custodes"]],
+        }
+
+        score = score_sql_case(case, actual)
+
+        self.assertTrue(score["required_columns_present"])
+        self.assertFalse(score["rows_correct"])
+        self.assertFalse(score["execution_correct"])
+
+    def test_enriched_result_fails_when_required_column_is_missing(self):
+        case = {
+            "case_id": "sql_007",
+            "expected_status": "ok",
+            "expected_columns": ["faction_name"],
+            "expected_rows": [["Space Marines"]],
+            "order_sensitive": False,
+        }
+        actual = {
+            "status": "ok",
+            "columns": ["faction_id", "datasheet_name"],
+            "rows": [["SM", "Imperial Space Marine"]],
+        }
+
+        score = score_sql_case(case, actual)
+
+        self.assertFalse(score["required_columns_present"])
+        self.assertFalse(score["rows_correct"])
+        self.assertFalse(score["execution_correct"])
+
     def test_empty_and_unsupported_are_scored_by_status(self):
         empty = score_sql_case(
             {"case_id": "sql_010", "expected_status": "empty"},

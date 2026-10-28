@@ -223,6 +223,48 @@ def _normalise_columns(value: Any, field: str) -> tuple[str, ...]:
     return tuple(_normalise_text(item).casefold() for item in value)
 
 
+# The public SQL result intentionally exposes useful metadata in addition to the
+# projection requested by a benchmark case.  Keep the benchmark vocabulary
+# small and explicit while accepting the corresponding public-result names.
+# These are schema-level aliases, not case-specific exceptions.
+_SQL_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "weapon": ("weapon_name",),
+    "attacks": ("a",),
+    "bs_ws": ("bsws",),
+    "strength": ("s",),
+    "damage": ("d",),
+}
+
+
+def _sql_projection_indices(
+    expected: tuple[str, ...], actual: tuple[str, ...]
+) -> tuple[int, ...] | None:
+    """Map requested benchmark columns onto a possibly richer SQL result.
+
+    Exact names take precedence over declared schema aliases.  When both sides
+    have the same width, preserve the existing execution-equivalence behaviour:
+    generated SQL aliases may differ harmlessly while values remain positional.
+    """
+    indices: list[int] = []
+    used: set[int] = set()
+    for requested in expected:
+        accepted = (requested, *_SQL_COLUMN_ALIASES.get(requested, ()))
+        match = next(
+            (
+                index
+                for name in accepted
+                for index, candidate in enumerate(actual)
+                if candidate == name and index not in used
+            ),
+            None,
+        )
+        if match is None:
+            return tuple(range(len(expected))) if len(actual) == len(expected) else None
+        indices.append(match)
+        used.add(match)
+    return tuple(indices)
+
+
 def _normalise_rows(value: Any, width: int, field: str) -> list[tuple[tuple[str, Any], ...]]:
     if not isinstance(value, (list, tuple)):
         raise MetricInputError(f"{field} must be a list of rows")
@@ -269,16 +311,15 @@ def score_sql_case(
         expected_rows = _normalise_rows(
             case.get("expected_rows"), len(expected_columns), "expected_rows"
         )
-        actual_rows = _normalise_rows(
+        full_actual_rows = _normalise_rows(
             actual_result.get("rows", []), len(actual_columns), "actual rows"
         )
         column_count_correct = len(actual_columns) == len(expected_columns)
-        # Generated SQL may use a different but harmless output alias (for
-        # example, ``model_name`` instead of ``unit_name``). Keep exact column
-        # equality as diagnostic information, but score execution equivalence
-        # from the result shape and values rather than alias spelling.
         columns_correct = actual_columns == expected_columns
-        if column_count_correct:
+        projection = _sql_projection_indices(expected_columns, actual_columns)
+        required_columns_present = projection is not None
+        if projection is not None:
+            actual_rows = [tuple(row[index] for index in projection) for row in full_actual_rows]
             if bool(case.get("order_sensitive")):
                 rows_correct = actual_rows == expected_rows
             else:
@@ -286,15 +327,17 @@ def score_sql_case(
                 rows_correct = Counter(actual_rows) == Counter(expected_rows)
         else:
             rows_correct = False
-        execution_correct = status_correct and column_count_correct and rows_correct
+        execution_correct = status_correct and required_columns_present and rows_correct
         result_correct = execution_correct
     elif expected_status == "empty":
+        required_columns_present = None
         actual_rows = actual_result.get("rows", [])
         if not isinstance(actual_rows, (list, tuple)):
             raise MetricInputError(f"{case_id}: actual rows must be a list")
         rows_correct = len(actual_rows) == 0
         result_correct = status_correct and rows_correct
     else:
+        required_columns_present = None
         result_correct = status_correct
 
     return {
@@ -304,6 +347,7 @@ def score_sql_case(
         "status_correct": status_correct,
         "columns_correct": columns_correct,
         "column_count_correct": column_count_correct,
+        "required_columns_present": required_columns_present,
         "rows_correct": rows_correct,
         "execution_correct": execution_correct,
         "result_correct": result_correct,
