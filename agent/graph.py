@@ -158,6 +158,7 @@ def prepare_rulebook_query(state: AgentState, runtime: Runtime[EvidenceContext])
         }, ensure_ascii=False, default=lambda blob: {"bytes_hex": blob.hex()}),
         config={
             "system_instruction": REFINEMENT_PROMPT,
+            "temperature": 0,
             "response_mime_type": "application/json",
             "response_json_schema": _QueryRefinement.model_json_schema(),
             "automatic_function_calling": {"disable": True},

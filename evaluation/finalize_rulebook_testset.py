@@ -75,14 +75,23 @@ REVIEWED_CASES: dict[str, dict[str, Any]] = {
         "review_notes": "Distinguishes general mission-dependent scoring from the Capture and Control example.",
     },
     "rb_004": {
-        "question": "When does an Aircraft placed into Strategic Reserves return?",
+        "question": (
+            "During its Normal move, an Aircraft cannot complete its minimum 20-inch "
+            "move and is therefore placed into Strategic Reserves. When will that "
+            "Aircraft return?"
+        ),
         "question_type": "single_hop_specific",
         "reference_answer": (
-            "If an Aircraft model is placed into Strategic Reserves, it will always "
-            "arrive from Strategic Reserves in your next turn."
+            "If an Aircraft is placed into Strategic Reserves because it cannot "
+            "complete its minimum move, it will always arrive from Strategic Reserves "
+            "in your next turn."
         ),
         "reference_chunk_ids": ["core-rules-aircraft-in-the-movement-phase-001-001"],
-        "review_notes": "RAGAS wording normalized into a complete question.",
+        "review_notes": (
+            "Clarified that the Aircraft entered Strategic Reserves because it could "
+            "not complete its minimum move, distinguishing this rule from an Aircraft "
+            "that starts the battle in Reserves."
+        ),
     },
     "rb_005": {
         "question": (

@@ -141,6 +141,7 @@ class HybridRetrievalTests(unittest.TestCase):
         execute.assert_called_once_with(self.path, sql, {})
         dictionary = DATA_DICTIONARY_PATH.read_text(encoding="utf-8")
         for call in client.models.generate_content.call_args_list:
+            self.assertEqual(call.kwargs["config"]["temperature"], 0)
             prompt = call.kwargs["config"]["system_instruction"]
             reference = prompt.split("<data_dictionary>\n", 1)[1].rsplit("\n</data_dictionary>", 1)[0]
             self.assertEqual(reference, dictionary)

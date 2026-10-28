@@ -102,6 +102,17 @@ def _git_commit() -> str | None:
         return None
 
 
+def _git_dirty() -> bool | None:
+    """Report whether uncommitted files make the recorded commit incomplete."""
+    try:
+        return bool(subprocess.run(
+            ["git", "status", "--porcelain"], cwd=ROOT, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip())
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 class AgentExecutor:
     """Run each case in an isolated session while reusing loaded resources."""
 
@@ -250,6 +261,7 @@ def _summary(
         "models": {"agent": model, "ragas_judge": judge_model},
         "versions": {
             "git_commit": _git_commit(),
+            "git_dirty": _git_dirty(),
             "sqlite_sha256": _file_hash(ROOT / "data/sql/wahadb.sqlite"),
             "chunks_sha256": _file_hash(ROOT / "data/processed/Core Rules.chunks.jsonl"),
             "index_manifest_sha256": _file_hash(ROOT / "data/indexes/core_rules/index_manifest.json"),
@@ -271,14 +283,85 @@ def _summary(
     }
 
 
+def _quoted(value: Any) -> list[str]:
+    text = str(value or "(no answer returned)")
+    return [f"> {line}" if line else ">" for line in text.splitlines()]
+
+
+def _failure_report(item: Mapping[str, Any]) -> list[str]:
+    """Render enough evidence to distinguish a bad answer from a strict metric miss."""
+    reason = item.get("error_type") or "benchmark_mismatch"
+    lines = [f"### `{item['case_id']}` — {reason}", ""]
+    question = item.get("question")
+    if question:
+        lines.append(f"- Question: {question}")
+    lines.extend([
+        f"- Expected route: `{item.get('expected_route') or 'unknown'}`",
+        f"- Predicted route: `{item.get('predicted_route') or 'missing'}`",
+    ])
+    if item.get("error"):
+        lines.extend(["- Error:", "", "```json", json.dumps(item["error"], indent=2), "```", ""])
+
+    actual = item.get("actual")
+    if isinstance(actual, Mapping):
+        query_set = (actual.get("route_plan") or {}).get("rulebook_query_set")
+        if isinstance(query_set, Mapping):
+            lines.extend([
+                f"- Semantic query: {query_set.get('semantic_query')}",
+                f"- Keyword query: {', '.join(query_set.get('keyword_query') or [])}",
+            ])
+        lines.extend(["", "**Actual answer**", "", *_quoted(actual.get("answer")), ""])
+        if item.get("reference_answer"):
+            lines.extend([
+                "**Reference answer**", "", *_quoted(item["reference_answer"]), "",
+            ])
+
+        results = actual.get("rulebook_results")
+        if isinstance(results, list) and results:
+            lines.extend(["**Retrieved Rulebook chunks**", ""])
+            for rank, result in enumerate(results, 1):
+                chunk = result.get("chunk", result) if isinstance(result, Mapping) else {}
+                section = chunk.get("section_path") or []
+                title = " / ".join(section) if isinstance(section, list) else str(section)
+                lines.append(
+                    f"{rank}. `{chunk.get('chunk_id', 'unknown')}`"
+                    + (f" — {title}" if title else "")
+                )
+            lines.append("")
+
+        sql_result = actual.get("sql_result")
+        if isinstance(sql_result, Mapping):
+            compact_sql = {
+                key: sql_result.get(key)
+                for key in ("status", "strategy", "columns", "rows", "error_code", "candidates")
+                if key in sql_result
+            }
+            lines.extend([
+                "**Actual SQL result**", "", "```json",
+                json.dumps(compact_sql, ensure_ascii=False, indent=2), "```", "",
+            ])
+
+    deterministic = item.get("deterministic")
+    if isinstance(deterministic, Mapping):
+        missing = deterministic.get("missing_reference_chunk_ids")
+        if missing:
+            lines.extend(["**Missing reference chunks**", ""])
+            lines.extend(f"- `{chunk_id}`" for chunk_id in missing)
+            lines.append("")
+    return lines
+
+
 def _report(summary: Mapping[str, Any], failures: Sequence[Mapping[str, Any]]) -> str:
     counts = summary["counts"]
+    versions = summary["versions"]
     lines = [
         "# Evaluation Report", "",
         f"- Run ID: `{summary['run_id']}`",
         f"- Dataset: `{summary['dataset_selection']}`",
         f"- Agent model: `{summary['models']['agent']}`",
-        f"- RAGAS judge: `{summary['models']['ragas_judge'] or 'not run'}`", "",
+        f"- RAGAS judge: `{summary['models']['ragas_judge'] or 'not run'}`",
+        f"- Git commit: `{versions.get('git_commit') or 'unavailable'}`",
+        f"- Uncommitted changes: `{versions.get('git_dirty')}`", "",
         "## Results", "",
         f"- Total: {counts['total']}",
         f"- Passed: {counts['passed']}",
@@ -289,11 +372,10 @@ def _report(summary: Mapping[str, Any], failures: Sequence[Mapping[str, Any]]) -
         json.dumps(summary["ragas"], indent=2), "```", "",
         "## Failures", "",
     ]
-    lines.extend(
-        f"- `{item['case_id']}`: {item['error_type'] or 'benchmark_mismatch'}"
-        for item in failures
-    )
-    if not failures:
+    if failures:
+        for item in failures:
+            lines.extend(_failure_report(item))
+    else:
         lines.append("No failures recorded.")
     return "\n".join(lines) + "\n"
 
@@ -345,6 +427,7 @@ def run_evaluation(
         record = {
             "run_id": run_id, "case_id": case["case_id"], "dataset": dataset,
             "question": case["question"], "expected_route": _expected_route(dataset, case),
+            "reference_answer": case.get("reference_answer"),
             "predicted_route": None, "benchmark_passed": False,
             "error_type": None, "error": None, "deterministic": None,
             "ragas": None, "actual": None, "reference": case,

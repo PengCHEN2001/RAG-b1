@@ -94,7 +94,7 @@ class _PlanningOutput(BaseModel):
 
     standalone_question: NonEmptyText = Field(description="Self-contained natural-language question, preserving supplied entity names.")
     route: Route
-    reason: NonEmptyText
+    reason: str
     sql_question: NonEmptyText | None = Field(description="Natural-language database question, never SQL. For sql, repeat standalone_question; for both, extract the database part.")
     semantic_query: NonEmptyText | None
     keyword_query: Keywords | None
@@ -183,6 +183,7 @@ def plan(state: AgentState, *, client=None, model: str = DEFAULT_MODEL,
         contents=json.dumps(content, ensure_ascii=False),
         config={
             "system_instruction": PLANNING_PROMPT,
+            "temperature": 0,
             "response_mime_type": "application/json",
             "response_json_schema": _PlanningOutput.model_json_schema(),
             "automatic_function_calling": {"disable": True},
@@ -201,7 +202,7 @@ def plan(state: AgentState, *, client=None, model: str = DEFAULT_MODEL,
         "standalone_question": output.standalone_question,
         "route_plan": RoutePlan(
             route=output.route,
-            reason=output.reason,
+            reason=output.reason or "Route selected by planner.",
             sql_question=output.standalone_question if output.route == "sql" else output.sql_question,
             rulebook_query_set=query_set,
             depends_on_sql=output.depends_on_sql,

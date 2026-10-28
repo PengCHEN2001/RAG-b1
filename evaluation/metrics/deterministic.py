@@ -259,6 +259,7 @@ def score_sql_case(
 
     status_correct = actual_status == expected_status
     columns_correct: bool | None = None
+    column_count_correct: bool | None = None
     rows_correct: bool | None = None
     execution_correct: bool | None = None
 
@@ -271,8 +272,13 @@ def score_sql_case(
         actual_rows = _normalise_rows(
             actual_result.get("rows", []), len(actual_columns), "actual rows"
         )
+        column_count_correct = len(actual_columns) == len(expected_columns)
+        # Generated SQL may use a different but harmless output alias (for
+        # example, ``model_name`` instead of ``unit_name``). Keep exact column
+        # equality as diagnostic information, but score execution equivalence
+        # from the result shape and values rather than alias spelling.
         columns_correct = actual_columns == expected_columns
-        if columns_correct:
+        if column_count_correct:
             if bool(case.get("order_sensitive")):
                 rows_correct = actual_rows == expected_rows
             else:
@@ -280,7 +286,7 @@ def score_sql_case(
                 rows_correct = Counter(actual_rows) == Counter(expected_rows)
         else:
             rows_correct = False
-        execution_correct = status_correct and columns_correct and rows_correct
+        execution_correct = status_correct and column_count_correct and rows_correct
         result_correct = execution_correct
     elif expected_status == "empty":
         actual_rows = actual_result.get("rows", [])
@@ -297,6 +303,7 @@ def score_sql_case(
         "actual_status": actual_status,
         "status_correct": status_correct,
         "columns_correct": columns_correct,
+        "column_count_correct": column_count_correct,
         "rows_correct": rows_correct,
         "execution_correct": execution_correct,
         "result_correct": result_correct,

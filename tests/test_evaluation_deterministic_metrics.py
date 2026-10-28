@@ -84,6 +84,47 @@ class SqlMetricTests(unittest.TestCase):
         self.assertFalse(score["rows_correct"])
         self.assertFalse(score["execution_correct"])
 
+    def test_equivalent_values_accept_different_generated_sql_aliases(self):
+        case = {
+            "case_id": "sql_001",
+            "expected_status": "ok",
+            "expected_columns": ["unit_name", "toughness"],
+            "expected_rows": [["Imperial Space Marine", "4"]],
+            "order_sensitive": False,
+        }
+        actual = {
+            "status": "ok",
+            "columns": ["model_name", "toughness"],
+            "rows": [["Imperial Space Marine", "4"]],
+        }
+
+        score = score_sql_case(case, actual)
+
+        self.assertFalse(score["columns_correct"])
+        self.assertTrue(score["column_count_correct"])
+        self.assertTrue(score["rows_correct"])
+        self.assertTrue(score["execution_correct"])
+
+    def test_different_column_count_is_not_execution_equivalent(self):
+        case = {
+            "case_id": "sql_001",
+            "expected_status": "ok",
+            "expected_columns": ["unit_name", "toughness"],
+            "expected_rows": [["Imperial Space Marine", "4"]],
+            "order_sensitive": False,
+        }
+        actual = {
+            "status": "ok",
+            "columns": ["toughness"],
+            "rows": [["4"]],
+        }
+
+        score = score_sql_case(case, actual)
+
+        self.assertFalse(score["column_count_correct"])
+        self.assertFalse(score["rows_correct"])
+        self.assertFalse(score["execution_correct"])
+
     def test_empty_and_unsupported_are_scored_by_status(self):
         empty = score_sql_case(
             {"case_id": "sql_010", "expected_status": "empty"},

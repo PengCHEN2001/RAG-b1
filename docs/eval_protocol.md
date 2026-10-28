@@ -259,13 +259,17 @@ Each normal case contains a reviewed `gold_sql`, `expected_columns`, and
 the generated SQL does not need to use the same syntax. Two different SQL
 statements are considered equivalent when they return the same correct result.
 
-The comparison normalizes column names, Unicode text, numeric values, and the
-known database encoding issue. Row order is ignored unless the case explicitly
-sets `order_sensitive`. Duplicate-row multiplicity is preserved.
+The comparison normalizes Unicode text, numeric values, and the known database
+encoding issue. It requires the expected result shape and row values, but does
+not reject an otherwise equivalent result only because generated SQL uses a
+different output alias (for example, `model_name` instead of `unit_name`). Exact
+column-name equality is retained as diagnostic information. Row order is ignored
+unless the case explicitly sets `order_sensitive`; duplicate-row multiplicity is
+preserved.
 
 The reported metrics are:
 
-- **Execution Accuracy:** correct columns and rows among cases expecting data;
+- **Execution Accuracy:** correct result shape and row values among cases expecting data;
 - **Status Accuracy:** correct handling of `ok`, `empty`, `needs_clarification`, and `unsupported`;
 - **Result Accuracy:** the complete per-case result, including non-success states;
 - **Error Rate:** the proportion of cases returning `error`;

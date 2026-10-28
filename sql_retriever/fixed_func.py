@@ -87,6 +87,7 @@ def sql_retrieve_fixed_funcs(
         contents=query,
         config={
             "system_instruction": FIXED_FUNC_SYSTEM_PROMPT,
+            "temperature": 0,
             "response_mime_type": "application/json",
             "response_json_schema": response_schema,
             # The application validates and dispatches the returned JSON itself.

@@ -12,7 +12,7 @@
 | rb_001 | teacher_required | single_hop_specific | What is the rule for Grenades? |
 | rb_002 | teacher_required | single_hop_specific | How can I use a Stratagem? |
 | rb_003 | teacher_required | multi_hop_abstract | What are the different ways to score points? |
-| rb_004 | ragas_generated | single_hop_specific | When does an Aircraft placed into Strategic Reserves return? |
+| rb_004 | ragas_generated | single_hop_specific | During its Normal move, an Aircraft cannot complete its minimum 20-inch move and is therefore placed into Strategic Reserves. When will that Aircraft return? |
 | rb_005 | ragas_generated | single_hop_specific | Can my unit still make a Normal or Advance move during the Movement phase if the only enemy models within its Engagement Range are Aircraft? |
 | rb_006 | ragas_generated | multi_hop_abstract | An Aircraft cannot complete its minimum move and is placed into Strategic Reserves. When will it return, and after it returns, which units can charge it or make melee attacks against it? |
 
@@ -59,15 +59,15 @@
 
 ## rb_004 — single_hop_specific
 
-**Question:** When does an Aircraft placed into Strategic Reserves return?
+**Question:** During its Normal move, an Aircraft cannot complete its minimum 20-inch move and is therefore placed into Strategic Reserves. When will that Aircraft return?
 
-**Reference answer:** If an Aircraft model is placed into Strategic Reserves, it will always arrive from Strategic Reserves in your next turn.
+**Reference answer:** If an Aircraft is placed into Strategic Reserves because it cannot complete its minimum move, it will always arrive from Strategic Reserves in your next turn.
 
 **Reference chunks:**
 
 - `core-rules-aircraft-in-the-movement-phase-001-001` — AIRCRAFT IN THE MOVEMENT PHASE, page(s) 53, mapping 100.0%
 
-**Review:** approved — RAGAS wording normalized into a complete question.
+**Review:** approved — Clarified that the Aircraft entered Strategic Reserves because it could not complete its minimum move, distinguishing this rule from an Aircraft that starts the battle in Reserves.
 
 
 ## rb_005 — single_hop_specific

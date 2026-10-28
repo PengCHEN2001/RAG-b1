@@ -206,6 +206,7 @@ def respond(state: AgentState, *, client=None, model: str = DEFAULT_MODEL,
         }, ensure_ascii=False, default=lambda blob: {"bytes_hex": blob.hex()}),
         config={
             "system_instruction": RESPONSE_PROMPT,
+            "temperature": 0.2,
             "response_mime_type": "application/json",
             "response_json_schema": _ResponseOutput.model_json_schema(),
             "automatic_function_calling": {"disable": True},

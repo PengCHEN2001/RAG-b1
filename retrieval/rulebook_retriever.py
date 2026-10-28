@@ -159,6 +159,37 @@ def reciprocal_rank_fusion(
     return sorted(fused.values(), key=lambda item: (-item.rrf_score, item.best_rank, item.chunk_id))
 
 
+def fuse_dense_rankings(
+    semantic: Iterable[RankedCandidate],
+    original: Iterable[RankedCandidate],
+    *,
+    constant: int = RRF_CONSTANT,
+) -> list[RankedCandidate]:
+    """Combine two Dense query formulations into one ranked Dense route.
+
+    The planner's semantic rewrite and the untouched user question are two
+    formulations of the same retrieval modality, rather than two independent
+    votes.  Internal RRF preserves documents found by either formulation, then
+    returns one ordinal Dense ranking for the outer hybrid fusion.
+    """
+    if constant < 0:
+        raise ValueError("constant must be non-negative.")
+    scores: dict[str, float] = {}
+    best_ranks: dict[str, int] = {}
+    for ranking in (semantic, original):
+        for candidate in ranking:
+            if candidate.rank < 1:
+                raise ValueError("Ranking positions must start at one.")
+            scores[candidate.chunk_id] = scores.get(candidate.chunk_id, 0.0) + 1 / (
+                constant + candidate.rank
+            )
+            best_ranks[candidate.chunk_id] = min(
+                best_ranks.get(candidate.chunk_id, candidate.rank), candidate.rank,
+            )
+    ordered = sorted(scores, key=lambda chunk_id: (-scores[chunk_id], best_ranks[chunk_id], chunk_id))
+    return [RankedCandidate(chunk_id, rank + 1, scores[chunk_id]) for rank, chunk_id in enumerate(ordered)]
+
+
 class RulebookRetriever:
     """Retrieve rulebook evidence through Dense + BM25 + RRF + reranking."""
 
@@ -273,11 +304,16 @@ class RulebookRetriever:
         retrieval_k: int = DEFAULT_RETRIEVAL_K,
         final_k: int = DEFAULT_FINAL_K,
     ) -> RetrievedRulebookContext:
-        """Run three retrieval routes, fuse them, rerank, and return evidence."""
+        """Run two-query Dense, BM25, RRF, reranking, and return evidence."""
         if retrieval_k < 1 or final_k < 1:
             raise ValueError("retrieval_k and final_k must be positive.")
         planned = query_set.normalised()
-        dense = self._dense_search(planned.semantic_query or planned.original_query, retrieval_k)
+        dense_semantic = self._dense_search(planned.semantic_query or planned.original_query, retrieval_k)
+        dense_original = self._dense_search(planned.original_query, retrieval_k)
+        # Keep two Dense formulations as one modality before outer RRF. This
+        # prevents a rewritten query from hiding the user's wording without
+        # giving Dense twice the voting weight of BM25.
+        dense = fuse_dense_rankings(dense_semantic, dense_original)[:retrieval_k]
         bm25_original = self._bm25_search(planned.original_query, retrieval_k)
         bm25_keyword = self._bm25_search(planned.keyword_text, retrieval_k)
         fused = reciprocal_rank_fusion(dense, bm25_original, bm25_keyword)[:retrieval_k]
@@ -288,10 +324,25 @@ class RulebookRetriever:
             for item in fused
         ]
         scores = self._get_reranker().predict(pairs, show_progress_bar=False)
+        scored = list(zip(fused, scores, strict=True))
         reranked = sorted(
-            zip(fused, scores, strict=True),
+            scored,
             key=lambda item: (-float(item[1]), -item[0].rrf_score, item[0].chunk_id),
-        )[:final_k]
+        )
+        # Protect at most one high-confidence consensus candidate before letting
+        # the cross-encoder order the remaining slots. A candidate qualifies only
+        # when at least two independent retrieval routes rank it first.
+        consensus = next((
+            item for item in scored
+            if sum(rank == 1 for rank in (
+                item[0].dense_rank,
+                item[0].bm25_original_rank,
+                item[0].bm25_keyword_rank,
+            )) >= 2
+        ), None)
+        selected = reranked[:final_k] if consensus is None else [consensus, *(
+            item for item in reranked if item[0].chunk_id != consensus[0].chunk_id
+        )][:final_k]
         results = tuple(
             RetrievedChunk(
                 chunk=self.chunk_records[candidate.chunk_id],
@@ -301,7 +352,7 @@ class RulebookRetriever:
                 rrf_score=candidate.rrf_score,
                 reranker_score=float(score),
             )
-            for candidate, score in reranked
+            for candidate, score in selected
         )
         return RetrievedRulebookContext(planned, results)
 

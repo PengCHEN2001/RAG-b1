@@ -130,6 +130,9 @@ class AgentNodeTests(unittest.TestCase):
         self.assertEqual(query_set.original_query, question)
         self.assertEqual(query_set.keyword_query, ("Advance", "Normal Move", "Movement phase"))
         self.assertIsNone(result["route_plan"]["sql_question"])
+        self.assertEqual(
+            client.models.generate_content.call_args.kwargs["config"]["temperature"], 0
+        )
         client.models.generate_content.assert_called_once()
 
     def test_sql_route_uses_the_full_question_instead_of_a_second_model_written_query(self):
@@ -181,6 +184,19 @@ class AgentNodeTests(unittest.TestCase):
                 self.assertIsNotNone(route["sql_question"])
                 self.assertIsInstance(route["rulebook_query_set"], RulebookQuerySet)
                 client.models.generate_content.assert_called_once()
+
+    def test_empty_reason_uses_a_nonfunctional_display_fallback(self):
+        result = plan(
+            {"user_input": "What is the Toughness of an Imperial Space Marine?"},
+            client=client_for(planning_output(reason="   ")),
+        )
+
+        self.assertEqual(result["route_plan"]["route"], "sql")
+        self.assertEqual(result["route_plan"]["reason"], "Route selected by planner.")
+        self.assertEqual(
+            result["route_plan"]["sql_question"],
+            "What is the Toughness of Warboss?",
+        )
 
     def test_new_topic_clears_previous_scope_and_pending_question(self):
         client = client_for(planning_output("rulebook", starts_new_topic=True))

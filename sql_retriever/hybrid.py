@@ -179,6 +179,7 @@ def _model_json(client, model: str, prompt: str, content: dict, schema: dict, *,
             contents=json.dumps(content, ensure_ascii=False), 
             config={
                 "system_instruction": prompt, 
+                "temperature": 0,
                 "response_mime_type": "application/json",
                 "response_json_schema": schema,
                 "automatic_function_calling": {"disable": True},

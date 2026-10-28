@@ -142,6 +142,10 @@ class EvaluationRunnerTests(unittest.TestCase):
         self.assertEqual(summary["counts"]["failed"], 6)
         self.assertEqual(len(failures), 6)
         self.assertTrue(all(not record["benchmark_passed"] for record in failures))
+        report = paths.report.read_text()
+        self.assertIn("**Actual answer**", report)
+        self.assertIn("**Reference answer**", report)
+        self.assertIn("**Retrieved Rulebook chunks**", report)
 
     def test_empty_ragas_batch_requires_neither_dependencies_nor_api_key(self):
         self.assertEqual(

@@ -68,6 +68,10 @@ class AgentResponseTests(unittest.TestCase):
                 payload = json.loads(self.context.client.models.generate_content.call_args.kwargs["contents"])
                 self.assertEqual(payload["question"], "原始问题")
                 self.assertNotIn("history", payload)
+                self.assertEqual(
+                    self.context.client.models.generate_content.call_args.kwargs["config"]["temperature"],
+                    0.2,
+                )
                 if "R1" in expected_refs:
                     self.assertEqual(payload["sources"]["R1"]["pdf_page_numbers"], [7])
                 self.assertEqual(self.context.client.models.generate_content.call_count, 3 if dependent else 2)

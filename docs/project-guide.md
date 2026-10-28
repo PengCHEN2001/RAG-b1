@@ -211,7 +211,8 @@ RulebookRetriever
 │     ├── lazy-load local cross-encoder/ms-marco-MiniLM-L6-v2 on the first request
 │     ├── reuse the loaded reranker for later requests
 │     ├── score 12 pairs: (semantic_query, candidate_chunk.text)
-│     ├── sort candidates by reranker score
+│     ├── preserve one candidate only when at least two retrieval routes rank it first
+│     ├── use reranker scores to order the remaining candidates
 │     └── keep final top 5 source chunks
 │
 └── Return RetrievedRulebookContext

@@ -75,6 +75,10 @@ class EvidenceGraphTests(unittest.TestCase):
                     expected.append("prepare_rulebook_query")
                     payload = json.loads(self.context.client.models.generate_content.call_args.kwargs["contents"])
                     self.assertEqual(payload["sql_evidence"]["rows"], [["000000001", "Feel No Pain 5+"]])
+                    self.assertEqual(
+                        self.context.client.models.generate_content.call_args.kwargs["config"]["temperature"],
+                        0,
+                    )
                 if route in ("rulebook", "both"):
                     expected.append("retrieve_rulebook")
                     query = self.rules.retrieve.call_args.args[0]
