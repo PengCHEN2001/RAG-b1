@@ -50,8 +50,8 @@ The runner creates a unique run directory and prints the paths of the generated
 raw results, summary, failure list, and Markdown report.
 
 Application calls are paced for the Gemini free tier, so a complete run is
-expected to take several minutes. Run the deterministic benchmark first. The
-RAGAS integration owns separate LangChain/Gemini clients and is not covered by
+expected to take several minutes. Run the normal evaluation without RAGAS first.
+The RAGAS integration owns separate LangChain/Gemini clients and is not covered by
 the application call limiter; `--ragas` should therefore be run separately and
 provider failures must remain visible as evaluation errors.
 
