@@ -20,6 +20,10 @@ Open a retained run in the same TUI without API calls: `uv run python -m ui.tui 
 
 CLI/TUI report LLM SDK calls and provider token usage per turn and session, including SQL routing, generation and repair. API errors and missing usage remain `null`; incomplete totals retain separate known subtotals and coverage counts. `/new` resets session totals, and inspecting an old turn does not count it again. Token reporting works with `--no-trace`; older traces show unavailable usage.
 
+## Troubleshooting
+
+If the CLI reports `error at plan: ClientError. Check the trace for stack/validation locations; check credentials/network for model failures.`, the planning request was rejected by the Google Gemini API before retrieval started. The same error at `respond` means the answer-generation request failed; any completed retrieval remains available in the trace. Check that `GOOGLE_API_KEY` is valid, the configured Gemini model is available to that key, the network connection works, and the Google AI Studio quota has not been exceeded. A `ClientError` can represent an invalid request, authentication or permission failure, or rate/quota limit; it does not by itself prove a Google server outage. Temporary API failures can be retried later.
+
 ## Documentation
 
 - See the [Project Guide](docs/project-guide.md) for the project structure, current design, setup, usage, and testing instructions.
