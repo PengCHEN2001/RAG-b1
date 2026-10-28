@@ -16,10 +16,9 @@ RAG-b1 is a Warhammer 40K question-answering project using a core rulebook PDF a
 - [Rulebook Retriever Design](#rulebook-retriever-design)
 - [SQL Retriever Design](#sql-retriever-design)
 - [Agent Graphs and Conversation Replies](#agent-graphs-and-conversation-replies)
-- [CLI and Local Graph Traces](#cli-and-local-graph-traces)
+- [CLI/TUI and Usage Monitoring](#clitui-and-usage-monitoring)
 - [Build and Simple Verification](#build-and-simple-verification)
 - [Evaluation](#evaluation)
-- [Final Submission Checklist](#final-submission-checklist)
 
 ## System Architecture
 
