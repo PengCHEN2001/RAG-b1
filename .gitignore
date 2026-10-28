@@ -231,9 +231,11 @@ data/indexes/
 evaluation/datasets/rulebook_candidates.jsonl
 evaluation/datasets/rulebook_candidates.md
 
-# Generated evaluation traces and reports. Commit a selected final report explicitly.
+# Generated evaluation traces and reports. Keep one example report for reference.
 evaluation/runs/
-evaluation/reports/
+evaluation/reports/*
+!evaluation/reports/20261028_173548/
+!evaluation/reports/20261028_173548/**
 
 # Local conversation/debug traces, retained across CLI sessions.
 data/traces/
