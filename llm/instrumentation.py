@@ -1,6 +1,8 @@
-"""Observe SDK calls and aggregate provider usage without inventing missing data."""
+"""Observe, pace and retry Gemini SDK calls without inventing usage data."""
 
-from time import perf_counter
+import os
+from threading import Lock
+from time import monotonic, perf_counter, sleep
 from uuid import uuid4
 
 
@@ -9,44 +11,144 @@ TOKEN_FIELDS = (
     "cached_content_token_count", "tool_use_prompt_token_count", "total_token_count",
 )
 
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
-def generate_content(client, *, purpose, on_event=None, cancel_event=None, **kwargs):
+
+def _env_number(name, default, cast):
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        parsed = cast(value)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
+
+
+class _GeminiThrottle:
+    """Reserve process-wide call slots so graph nodes share one rate limit."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self._next_call_at = 0.0
+
+    def wait(self, interval, *, cancel_event=None, on_wait=None):
+        if interval <= 0:
+            return
+        with self._lock:
+            delay = max(0.0, self._next_call_at - monotonic())
+            if delay > 0 and on_wait is not None:
+                on_wait(delay)
+            if delay > 0:
+                if cancel_event is not None:
+                    if cancel_event.wait(delay):
+                        raise KeyboardInterrupt
+                else:
+                    sleep(delay)
+            self._next_call_at = monotonic() + interval
+
+
+_GEMINI_THROTTLE = _GeminiThrottle()
+
+
+def _google_sdk_client(client):
+    """Keep injected offline/mock clients fast while pacing the real SDK."""
+    return type(client).__module__.startswith("google.genai")
+
+
+def _status_code(error):
+    for value in (
+        getattr(error, "code", None),
+        getattr(error, "status_code", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+    ):
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _retryable_provider_error(error):
+    code = _status_code(error)
+    return code in _RETRYABLE_STATUS_CODES or type(error).__name__ == "ServerError"
+
+
+def _wait(delay, cancel_event=None):
+    if delay <= 0:
+        return
+    if cancel_event is not None:
+        if cancel_event.wait(delay):
+            raise KeyboardInterrupt
+    else:
+        sleep(delay)
+
+
+def generate_content(
+    client, *, purpose, on_event=None, cancel_event=None,
+    provider_controls=None, **kwargs,
+):
     """Return the SDK response unchanged; record usage before caller validation.
 
-    One call means one SDK invocation, including errors, not internal HTTP
-    attempts. Observers receive metadata only, never prompts/provider errors.
+    One call means one SDK invocation, including every retry attempt. Observers
+    receive metadata only, never prompts or raw provider errors.
     """
     if cancel_event is not None and cancel_event.is_set():
         raise KeyboardInterrupt
-    started = perf_counter()
-    call = {"call_id": uuid4().hex, "purpose": purpose, "provider": "google",
-            "model": kwargs["model"], "usage": None}
+    controlled = _google_sdk_client(client) if provider_controls is None else provider_controls
+    interval = _env_number("GEMINI_MIN_INTERVAL_SECONDS", 5.0, float) if controlled else 0.0
+    max_attempts = max(1, _env_number("GEMINI_MAX_ATTEMPTS", 3, int)) if controlled else 1
+    retry_base = _env_number("GEMINI_RETRY_BASE_SECONDS", 5.0, float)
 
-    def emit(kind, **update):
-        if on_event is not None:
-            on_event({"event": kind, "payload": {**call, **update}})
+    for attempt in range(1, max_attempts + 1):
+        call = {
+            "call_id": uuid4().hex, "purpose": purpose, "provider": "google",
+            "model": kwargs["model"], "usage": None,
+            "attempt": attempt, "max_attempts": max_attempts,
+        }
 
-    emit("llm.started")
-    try:
-        response = client.models.generate_content(**kwargs)
-    except (Exception, KeyboardInterrupt) as error:
-        emit("llm.failed", duration_ms=(perf_counter() - started) * 1000,
-             error={"type": type(error).__name__})
-        raise
-    metadata = getattr(response, "usage_metadata", None)
-    usage = None
-    if metadata is not None:
-        # SDK fields are optional. Reject non-numeric telemetry at this external
-        # boundary without letting bad telemetry discard an otherwise valid reply.
-        usage = {field: value if type(value := getattr(metadata, field, None)) is int and value >= 0 else None
-                 for field in TOKEN_FIELDS}
-    details = {field: value if isinstance(value := getattr(response, field, None), str) else None
-               for field in ("response_id", "model_version")}
-    emit("llm.finished", duration_ms=(perf_counter() - started) * 1000, usage=usage, **details)
-    # An in-flight response still contributes usage when its answer is cancelled.
-    if cancel_event is not None and cancel_event.is_set():
-        raise KeyboardInterrupt
-    return response
+        def emit(kind, **update):
+            if on_event is not None:
+                on_event({"event": kind, "payload": {**call, **update}})
+
+        _GEMINI_THROTTLE.wait(
+            interval, cancel_event=cancel_event,
+            on_wait=lambda delay: emit("llm.waiting", wait_seconds=delay,
+                                       reason="provider_rate_limit"),
+        )
+        started = perf_counter()
+        emit("llm.started")
+        try:
+            response = client.models.generate_content(**kwargs)
+        except (Exception, KeyboardInterrupt) as error:
+            duration = (perf_counter() - started) * 1000
+            emit("llm.failed", duration_ms=duration, error={"type": type(error).__name__})
+            if (isinstance(error, KeyboardInterrupt) or attempt >= max_attempts
+                    or not _retryable_provider_error(error)):
+                raise
+            delay = retry_base * (2 ** (attempt - 1))
+            emit("llm.retrying", retry_in_seconds=delay,
+                 error={"type": type(error).__name__})
+            _wait(delay, cancel_event)
+            continue
+        metadata = getattr(response, "usage_metadata", None)
+        usage = None
+        if metadata is not None:
+            # SDK fields are optional. Reject non-numeric telemetry at this external
+            # boundary without letting bad telemetry discard an otherwise valid reply.
+            usage = {
+                field: value if type(value := getattr(metadata, field, None)) is int and value >= 0 else None
+                for field in TOKEN_FIELDS
+            }
+        details = {
+            field: value if isinstance(value := getattr(response, field, None), str) else None
+            for field in ("response_id", "model_version")
+        }
+        emit("llm.finished", duration_ms=(perf_counter() - started) * 1000,
+             usage=usage, **details)
+        # An in-flight response still contributes usage when its answer is cancelled.
+        if cancel_event is not None and cancel_event.is_set():
+            raise KeyboardInterrupt
+        return response
+    raise AssertionError("Gemini retry loop exhausted without returning or raising")
 
 
 def summarize_usage(usages, *, instrumentation_complete=True):

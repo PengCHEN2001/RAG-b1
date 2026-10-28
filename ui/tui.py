@@ -228,13 +228,23 @@ class RAGApp(App):
             table.update_cell(key, "Status", "done" if kind == "step.finished" else "failed")
             table.update_cell(key, "ms", f"{payload['duration_ms']:.1f}")
         elif kind.startswith("llm."):
-            self.calls[payload["call_id"]] = payload
+            if kind in ("llm.started", "llm.finished", "llm.failed"):
+                self.calls[payload["call_id"]] = payload
             key = event["span_id"]
             if kind == "llm.started":
                 table.add_row(f"↳ {payload['purpose']}", "running", "—", key=key)
-            else:
+            elif kind in ("llm.finished", "llm.failed"):
                 table.update_cell(key, "Status", "returned" if kind == "llm.finished" else "failed")
                 table.update_cell(key, "ms", f"{payload['duration_ms']:.1f}")
+            elif kind == "llm.waiting":
+                self.query_one("#notice", Static).update(
+                    f"Gemini rate limit: waiting {payload['wait_seconds']:.1f}s before {payload['purpose']}."
+                )
+            elif kind == "llm.retrying":
+                self.query_one("#notice", Static).update(
+                    f"Gemini temporary {payload['error']['type']}; retrying in "
+                    f"{payload['retry_in_seconds']:.1f}s."
+                )
             self.update_llm_stats()
         elif kind in ("route.selected", "query.refined"):
             self.plan = payload["route_plan"]

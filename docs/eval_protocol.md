@@ -49,6 +49,12 @@ uv run --env-file .env python -m evaluation.run --dataset combined
 The runner creates a unique run directory and prints the paths of the generated
 raw results, summary, failure list, and Markdown report.
 
+Application calls are paced for the Gemini free tier, so a complete run is
+expected to take several minutes. Run the deterministic benchmark first. The
+RAGAS integration owns separate LangChain/Gemini clients and is not covered by
+the application call limiter; `--ragas` should therefore be run separately and
+provider failures must remain visible as evaluation errors.
+
 ## Document outline
 
 1. **Purpose** — defines the questions that the evaluation must answer.
@@ -222,6 +228,14 @@ The evaluation uses the existing chunks instead of re-splitting the PDF. This
 ensures that the benchmark measures the knowledge units actually available to
 the Retriever.
 
+The evaluated Retriever performs four underlying searches: Dense retrieval on
+the Router's semantic rewrite, Dense retrieval on the unchanged user question,
+BM25 on the unchanged question, and BM25 on Router keywords. The two Dense
+rankings are first fused into one Dense route; this route and the two BM25
+routes are then fused and reranked. The hierarchy preserves the original
+question when a rewrite is too narrow without giving Dense retrieval twice the
+outer voting weight of BM25.
+
 ### Deterministic retrieval metrics
 
 Reference and retrieved chunks are matched by `chunk_id`. The following metrics
@@ -299,11 +313,14 @@ second duplicate dataset. Expected routes are derived from the dataset purpose:
 Router performance is reported using Accuracy, Macro-F1, per-route Precision
 and Recall, and a confusion matrix.
 
-A combined case is successful only when the Router selects `both` and the run
-returns evidence from both SQLite and the Rulebook. This prevents a plausible
-answer based on only one source from being counted as successful. Because the
-combined set contains only two cases, their final answers and citations are also
-appropriate for direct inspection in the final report.
+A combined case is successful only when the Router selects `both`, both
+Retrievers are actually called, the SQL result matches its referenced SQL case,
+all required Rulebook reference chunks are retrieved, the completed answer cites
+both source types, and the run outcome is `completed`. This prevents a plausible
+answer based on only one source, or a failed SQL object that merely exists, from
+being counted as successful. Because the combined set contains only two cases,
+their final answer correctness remains marked for direct human inspection in
+the final report rather than introducing another small custom LLM judge.
 
 ## 9. Runtime records and performance
 
@@ -345,20 +362,31 @@ The four output files serve different purposes:
 - `report.md` presents the configuration, metrics, and failures for review.
 
 No arbitrary pass threshold is set before observing the first complete run.
-The first reviewed full run becomes the baseline. Later runs can be compared
-against that baseline to detect regressions.
+The first reviewed full run with no unresolved `system_error`,
+`evaluation_error`, or `invalid_case` becomes the baseline. A run interrupted
+by provider quota or availability is retained for diagnosis but is not promoted
+to the project baseline. Later runs can be compared against that baseline to
+detect regressions.
 
 ## 11. Reproducibility and limitations
 
 The API key is read from `GOOGLE_API_KEY`. The application model, RAGAS judge,
 and embedding model can be selected through `GEMINI_MODEL`, `RAGAS_MODEL`, and
 `RAGAS_EMBEDDING_MODEL`. Secrets are never written to result files.
+Application calls are paced by `GEMINI_MIN_INTERVAL_SECONDS` and temporary
+provider failures use bounded exponential retries. Waiting and retry events are
+retained in the trace so provider instability is not silently hidden.
 
 Before producing the final report, the complete offline test suite is run with:
 
 ```bash
 uv run python -m unittest discover -s tests
 ```
+
+The formal baseline should be run from a committed working tree. The report's
+`git_commit` and `git_dirty` fields make local uncommitted changes explicit; a
+dirty exploratory run is useful for debugging but is not the final reproducible
+result.
 
 The evaluation has the following limitations:
 
@@ -369,8 +397,22 @@ The evaluation has the following limitations:
 - an incorrect SQL query can occasionally return the correct result on a specific snapshot;
 - Rulebook scores depend on the quality of the manually selected reference chunks;
 - unavailable token or model-usage metadata is reported as `null` rather than estimated.
+- the frozen benchmark is single-turn and does not score conversational memory;
+  follow-ups, clarification continuation, topic switching and `/new` are checked
+  separately through offline tests and manual CLI acceptance;
+- RAGAS judge calls currently use their own client and are not paced by the
+  application's Gemini throttle.
 
 For these reasons, the final assessment combines deterministic retrieval
 metrics, database-result accuracy, RAGAS answer metrics, and direct examination
 of failure cases. No single aggregate number is treated as a complete measure
 of system quality.
+
+### Final evaluation reminder
+
+Before selecting the final report, run the offline tests and deterministic
+benchmarks from a committed working tree, confirm that no provider failure is
+being misreported as a model-quality failure, manually review the two combined
+answers, and record the separate multi-turn chat checks. Run the optional RAGAS
+judge after the deterministic run when Gemini quota is available. Keep failed
+cases in the report; do not select a quota-interrupted run as the baseline.

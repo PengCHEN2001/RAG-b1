@@ -194,7 +194,8 @@ def run_turn(graph, context, *, session_id, question, trace_dir=DEFAULT_TRACE_DI
             except Empty:
                 break
             payload = event["payload"]
-            calls[payload["call_id"]] = payload
+            if event["event"] in ("llm.started", "llm.finished", "llm.failed"):
+                calls[payload["call_id"]] = payload
             emit(event["event"], payload, node=event["node"], span_id=payload["call_id"],
                  parent_span_id=node_spans[event["node"]])
 

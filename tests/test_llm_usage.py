@@ -15,7 +15,7 @@ from google.genai import types
 from agent import EvidenceContext, build_agent_graph
 from agent.runtime import read_trace, run_turn
 from evaluation.adapters.trace_adapter import load_evaluation_trace
-from llm.instrumentation import TOKEN_FIELDS, session_stats, summarize_usage
+from llm.instrumentation import TOKEN_FIELDS, generate_content, session_stats, summarize_usage
 from sql_retriever import retrieve_sql
 from sql_retriever.fixed_func import sql_retrieve_fixed_funcs
 from test_agent_graph import REFINED, rulebook_stub
@@ -126,6 +126,41 @@ class LLMUsageTests(unittest.TestCase):
         self.assertEqual(usage["reported_calls"]["total_token_count"], 2)
         self.assertFalse(usage["complete"])
         self.assertIsNone(session_stats([failed, partial_result])["usage"]["total_token_count"])
+
+    def test_temporary_provider_failure_is_paced_reported_and_retried(self):
+        class ServerError(RuntimeError):
+            code = 503
+
+        client = Mock()
+        client.models.generate_content.side_effect = [
+            ServerError("temporary provider failure"),
+            usage_response(planning_output("rulebook")),
+        ]
+        events = []
+        with (
+            patch("llm.instrumentation._GEMINI_THROTTLE.wait") as throttle,
+            patch("llm.instrumentation._wait") as retry_wait,
+            patch.dict("os.environ", {
+                "GEMINI_MIN_INTERVAL_SECONDS": "5",
+                "GEMINI_MAX_ATTEMPTS": "3",
+                "GEMINI_RETRY_BASE_SECONDS": "2",
+            }),
+        ):
+            response = generate_content(
+                client, purpose="plan", on_event=events.append,
+                provider_controls=True, model="test-model", contents="question",
+            )
+
+        self.assertIn("rulebook", response.text)
+        self.assertEqual(client.models.generate_content.call_count, 2)
+        self.assertEqual(throttle.call_count, 2)
+        retry_wait.assert_called_once_with(2.0, None)
+        self.assertEqual(
+            [event["event"] for event in events],
+            ["llm.started", "llm.failed", "llm.retrying", "llm.started", "llm.finished"],
+        )
+        self.assertEqual(events[0]["payload"]["attempt"], 1)
+        self.assertEqual(events[-1]["payload"]["attempt"], 2)
 
     def test_invalid_model_output_still_records_received_usage_and_missing_fields_stay_null(self):
         result = self.run_responses(usage_response({"invalid": True}))

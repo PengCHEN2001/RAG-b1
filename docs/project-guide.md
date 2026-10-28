@@ -15,13 +15,13 @@ RAG-b1/
 │   │   ├── wahadb.sqlite
 │   │   └── SQL_AGENT_DATA_DICTIONARY.md
 │   ├── processed/
-│       ├── Core Rules.corrections.json  # Versioned input; other files are generated
-│       ├── Core Rules.json
-│       ├── Core Rules.md
-│       ├── Core Rules.chunks.jsonl
-│       └── images/Core Rules/
-│           ├── picture-*.png
-│           └── manifest.json
+│   │   ├── Core Rules.corrections.json  # Versioned visual-text corrections
+│   │   ├── Core Rules.json
+│   │   ├── Core Rules.md
+│   │   ├── Core Rules.chunks.jsonl
+│   │   └── images/Core Rules/
+│   │       ├── picture-*.png
+│   │       └── manifest.json
 │   └── indexes/core_rules/
 │       ├── chroma/
 │       ├── bm25.pkl
@@ -35,16 +35,22 @@ RAG-b1/
 ├── retrieval/
 │   ├── __init__.py
 │   └── rulebook_retriever.py
+├── sql_retriever/          # Hybrid fixed/generated SQL retrieval and read-only safety
+├── llm/                    # Shared Gemini configuration, pacing, retries and usage tracking
 ├── agent/                 # State, planning, retrieval/answer graphs, turn runner and traces
 ├── ui/
 │   ├── cli.py             # python -m ui.cli
 │   └── tui.py             # python -m ui.tui
-├── tests/
-│   ├── test_pdf_parser.py
-│   ├── test_chunker.py
-│   └── test_rulebook_retriever.py
+├── evaluation/
+│   ├── datasets/          # Frozen Rulebook, SQL and combined benchmarks
+│   ├── adapters/          # Runtime trace to evaluation-record conversion
+│   ├── metrics/           # Deterministic retrieval, SQL and Router metrics
+│   ├── run.py             # Unified benchmark runner
+│   └── ragas_adapter.py   # Optional RAGAS judge integration
+├── tests/                 # Offline ingestion, retrieval, Agent, UI and evaluation tests
 ├── docs/
 │   ├── journal.md
+│   ├── eval_protocol.md
 │   └── project-guide.md
 ├── .env.example
 ├── Makefile
@@ -129,13 +135,17 @@ Implemented in `ingestion/build_index.py` from the same `Core Rules.chunks.jsonl
 - Dense index: ChromaDB `PersistentClient` stores chunk ID, text, filterable metadata, and its 768-dimensional vector in `data/indexes/core_rules/chroma/`.
 - Keyword index: `rank_bm25` creates `data/indexes/core_rules/bm25.pkl`; `bm25_chunk_ids.json` maps each BM25 position back to the same chunk ID.
 - `index_manifest.json` records the chunk file hash, chunk count, embedding model, vector dimension, and Chroma collection name.
-- The two indexes will later be queried together and combined with Reciprocal Rank Fusion (RRF) for hybrid retrieval. BM25 is stored beside Chroma, not inside it.
+- The two indexes are queried together and combined with hierarchical Reciprocal Rank Fusion (RRF) for hybrid retrieval. BM25 is stored beside Chroma, not inside it.
 
-All generated data in `data/processed/` and `data/indexes/` is ignored by Git and can be rebuilt from the source PDF.
+The parsed JSON, readable Markdown, final chunks, and correction file are
+committed so the submitted repository includes the parsed Rulebook data.
+Extracted PNG images and `data/indexes/` are larger rebuildable artifacts and
+remain local; `make prepare` regenerates them and rebuilds both indexes from the
+committed PDF and processing code.
 
 ## Rulebook Retriever Design
 
-Implemented in `retrieval/rulebook_retriever.py`. The Retriever does not route, rewrite, or answer questions. A future Router supplies the query set; the Retriever retrieves and ranks rulebook evidence only.
+Implemented in `retrieval/rulebook_retriever.py`. The Retriever does not route, rewrite, or answer questions. The Router supplies the query set; the Retriever retrieves and ranks rulebook evidence only.
 
 ```text
 RulebookQuerySet
@@ -172,13 +182,24 @@ RulebookRetriever
 │           └── data/processed/Core Rules.chunks.jsonl
 │                 └── chunk_id → full ChunkRecord
 │
-├── Dense Semantic Retrieval
+├── Dense Retrieval A: semantic rewrite
 │     ├── semantic_query
 │     ├── prepend the BGE query instruction
 │     ├── generate a normalised 768-dimensional query embedding
 │     ├── send the vector to Chroma
 │     ├── Chroma searches its persistent HNSW cosine index
 │     └── return top 12 semantically similar chunk IDs
+│
+├── Dense Retrieval B: unchanged user question
+│     ├── original_query
+│     ├── use the same BGE instruction, embedding model and Chroma index
+│     └── return top 12 chunks without depending on the Router rewrite
+│
+├── Inner Dense Fusion
+│     ├── apply RRF to the semantic-query and original-query Dense rankings
+│     ├── deduplicate by chunk_id
+│     ├── convert the fused result into one ordinal Dense ranking
+│     └── keep top 12 Dense candidates
 │
 ├── BM25 Original-Query Retrieval
 │     ├── original_query
@@ -193,9 +214,9 @@ RulebookRetriever
 │     └── return top 12 canonical-rule-term chunk IDs
 │
 ├── Candidate Collection
-│     ├── combine the three ranking lists
+│     ├── combine the fused Dense ranking and the two BM25 rankings
 │     ├── deduplicate by chunk_id
-│     ├── retain dense_rank, bm25_original_rank, and bm25_keyword_rank
+│     ├── retain fused dense_rank, bm25_original_rank, and bm25_keyword_rank
 │     └── use chunk_id to retrieve full source metadata when needed
 │
 ├── Reciprocal Rank Fusion
@@ -231,6 +252,14 @@ Final top 5 source chunks
 └── passed to the answer-generation layer with original_query.
     RulebookRetriever returns evidence only; it does not generate the final answer.
 ```
+
+The implementation therefore performs four underlying searches but gives the
+outer hybrid fusion three equally weighted rankings. Running Dense retrieval on
+both the untouched question and the semantic rewrite protects recall when the
+Router narrows or paraphrases a broad request. Fusing those two Dense lists
+first prevents the Dense modality from receiving two votes against each BM25
+route. The original-query BM25 route preserves exact user terminology, while
+keyword BM25 supplies canonical rule terms selected by the Router.
 
 The current reranker is `cross-encoder/ms-marco-MiniLM-L6-v2`. It is a small English cross-encoder, suitable for reranking only 12 candidates from the English rulebook on a local student laptop. If future evaluation requires stronger semantic ranking or multilingual query support, it can be replaced with, like the larger `Qwen/Qwen3-Reranker-0.6B`; that model requires substantially more local storage and memory.
 
@@ -340,7 +369,7 @@ Only a generated query's syntax or name-resolution failure permits one model rep
 - For a pure `sql` route, the application passes `standalone_question` directly to SQL retrieval instead of using a second model-authored query. For `both`, `sql_question` remains the natural-language database subquestion. Planning receives no data dictionary and must preserve supplied names and avoid generating SQL; the SQL retriever owns schema interpretation and receives the dictionary in routing and generation.
 - Planning receives history, explicit conversation conditions, and actual pending candidates. The model reports when a new topic should clear old conditions and pending clarification. It does not append an assistant message or run either retriever.
 - Clarification replies also receive the actual pending candidates, including their kinds; the application still appends the exact numbered candidate list.
-- Inject a GenAI-compatible `client` for testing; the default client is loaded lazily from `llm.llm`. Pydantic validates the response and route/query consistency. Invalid output and provider errors propagate without automatic retries or alternative retrieval.
+- Inject a GenAI-compatible `client` for testing; the default client is loaded lazily from `llm.llm`. Pydantic validates the response and route/query consistency. Invalid structured output propagates without an alternative route. Temporary provider failures first pass through the shared bounded retry policy; permanent failures and exhausted retries propagate to the runner.
 
 `agent/graph.py` provides `build_agent_graph()` for complete turns: evidence collection → `respond` → `finalize`. `build_evidence_graph()` retains the evidence-only entry point for retrieval inspection and evaluation.
 
@@ -370,7 +399,7 @@ print(followup["answer"])
 - Pass `context` explicitly to every `invoke` / `stream`. Reuse the context to reuse the lazy rulebook instance. Inject `client`, `model`, `rulebook_retriever`, or a `sql_retriever(question)` callable for offline use. Runtime dependencies are excluded from checkpoints.
 - Both routes run SQL first. Independent `both` uses the planned rulebook query directly; dependent `both` makes at most one refinement call using returned SQL facts. SQL clarification stops both modes and retains the full request and actual candidates. SQL empty/error/unsupported stops dependent retrieval; independent rulebook retrieval can continue with partial evidence.
 - Refinement uses at most 50 SQL rows and 32 KiB of serialized SQL context, removing whole trailing rows. `sql_context_truncated` records this separate from `sql_result.truncated`; the original result is unchanged. With no usable rows, dependent retrieval stops without guessing. SQLite blobs are labeled as hex in the prompt and remain bytes in state.
-- `evidence_status` is `ok / empty / partial / needs_clarification / unsupported / error / skipped`; `retrieval_errors` distinguishes rulebook availability failures from empty hits. `ok` means all requested evidence sources returned rows/chunks, not a semantic correctness score. Invalid model output / provider failures propagate and leave the last checkpoint available; the evidence summary remains unset when the graph fails before completion.
+- `evidence_status` is `ok / empty / partial / needs_clarification / unsupported / error / skipped`; `retrieval_errors` distinguishes rulebook availability failures from empty hits. `ok` means all requested evidence sources returned rows/chunks, not a semantic correctness score. Invalid model output and provider failures remaining after bounded retries propagate and leave the last checkpoint available; the evidence summary remains unset when the graph fails before completion.
 - `InMemorySaver` retains node checkpoints under `thread_id`; its serializer explicitly registers the existing result dataclasses and restores tuple fields. Reusing the graph and ID continues a session; a new ID isolates state. It does not persist across process exit, rotate old checkpoints, or provide detailed retriever traces yet.
 - To monitor node completion directly, use `graph.stream(..., stream_mode="updates", context=context)`; each update is keyed by node name. For retained traces and node lifecycle timings, use the turn runner below. Nested retriever phases, actual model requests/usage and answer-token streaming remain separate steps.
 
@@ -401,8 +430,8 @@ uv run python -m ui.cli --inspect data/traces/SESSION/RUN.jsonl --json
 - Disk tracing is on even when live step display is off. `--no-trace` disables files and can be combined with `--trace` for display only. `--trace-dir PATH` selects another local directory. No transcript is loaded into a new process automatically.
 - `agent.runtime.run_turn(graph, context, *, session_id, question, trace_dir=..., on_event=None, cancel_event=None)` is shared by the CLI and TUI. It consumes LangGraph's native `tasks` and `custom` streams, issues fresh run IDs, and sends the same redacted event records to the callback and JSONL writer. Keep a graph/context and session ID for follow-ups; use caller-generated internal session IDs, not arbitrary paths. `cancel_event` accepts a `threading.Event` for cooperative cancellation between graph events and SDK calls.
 - Each run writes `data/traces/<session_id>/<run_id>.jsonl`, with a `session.json` manifest containing creation time, model, Python/LangGraph versions, lock-file hash and working-source hash. The code hash identifies changes but does not retain a runnable code snapshot; data/index fingerprints and historical environments are not captured yet. Scope is graph events plus observed LLM SDK calls/usage; full model requests and retriever internals remain unavailable. Existing session manifests describe their creation-time capabilities; each run's events and summary describe its actual usage coverage.
-- Events contain schema version, session/run IDs, sequence, UTC timestamp, event/node, span and parent IDs. They cover `run.started`, node `step.started/finished/failed`, `route.selected`, `query.refined`, `retrieval.completed` and exactly one `run.finished` for a controlled turn. Node starts snapshot their actual State input; finishes snapshot updates, including history trimming/overwrite, planned queries, bounded retriever results, PDF metadata, SQL provenance, answer, citations and memory commits. These are **graph-node** inputs, not a recording of the exact model HTTP requests.
-- Durations use a monotonic clock and measure observed node lifecycles, including stream/trace/display overhead; run time includes cold model initialization. LLM events record observed SDK-call duration, including any SDK-internal retries. SQL's non-LLM internal phases, raw model outputs, repair SQL before/after snapshots and rulebook intermediate candidate rankings remain unavailable.
+- Events contain schema version, session/run IDs, sequence, UTC timestamp, event/node, span and parent IDs. They cover `run.started`, node `step.started/finished/failed`, `route.selected`, `query.refined`, `retrieval.completed`, LLM start/wait/retry/finish/failure events, and exactly one `run.finished` for a controlled turn. Node starts snapshot their actual State input; finishes snapshot updates, including history trimming/overwrite, planned queries, bounded retriever results, PDF metadata, SQL provenance, answer, citations and memory commits. These are **graph-node** inputs, not a recording of the exact model HTTP requests.
+- Durations use a monotonic clock and measure observed node lifecycles, including stream/trace/display overhead; run time includes cold model initialization, throttle waits and retry backoff. Each LLM attempt records its observed SDK-call duration, including retries internal to that SDK invocation; application-level retry attempts have separate call IDs. SQL's non-LLM internal phases, raw model outputs, repair SQL before/after snapshots and rulebook intermediate candidate rankings remain unavailable.
 - The writer flushes each complete JSON line. It does not promise power-loss durability. Write/open/close failures emit a visible `trace.failed` warning and mark the returned trace incomplete while preserving a valid answer. Error records retain exception type, validation locations and stack file/function/line locations, omitting raw provider messages, locals and source lines. Known configured API keys and credential fields are redacted; SDK clients and authentication headers are never serialized from runtime context.
 - `--inspect` reads saved records without building/resuming a graph or calling a model/SQL. It shows lifecycle, route and result; `--sources` resolves actual cited chunks or executed SQL, bindings, full bounded rows and separate prompt-clipping flags. `--json` exposes full recorded node snapshots. An incomplete final JSON fragment is skipped with a warning; a run without `run.finished` is `interrupted`. Corrupt middle records or mixed run IDs/sequence are rejected. This is replay of recorded facts, not a rerun of the original experiment.
 
@@ -412,7 +441,7 @@ The lower-level graph still propagates exceptions. The runner's returned outcome
 
 ```bash
 uv run python -m ui.tui
-uv run python -m ui.tui --model gemini-3.1-flash-lite
+uv run python -m ui.tui --model gemini-3.5-flash-lite
 uv run python -m ui.tui --inspect data/traces/SESSION/RUN.jsonl
 ```
 
@@ -426,7 +455,11 @@ Headless UI tests use Textual's `run_test`/Pilot with `unittest.IsolatedAsyncioT
 
 ### LLM calls and provider token usage
 
-`llm/instrumentation.py` wraps `generate_content` without changing its response or adding retries. Plan, dependent rulebook-query refinement, response generation, SQL routing/generation/repair and the legacy fixed-function entry use it. Each invocation emits `llm.started` and one `llm.finished`/`llm.failed`, with a unique call ID parented to its graph node. Events retain purpose, requested model, provider, monotonic duration, response ID/model version when supplied, and usage. Provider error text, credentials, prompts and raw responses are not copied into LLM metadata events. Usage is captured before JSON/citation validation, so invalid structured output still counts. `llm_calls` counts SDK invocations including failed calls; it does not claim to count HTTP retries hidden inside the SDK or evaluation-judge calls.
+`llm/instrumentation.py` is the shared boundary for application Gemini calls. Plan, dependent rulebook-query refinement, response generation, SQL routing/generation/repair and the legacy fixed-function entry all use it. The boundary applies a process-wide minimum interval between real SDK calls so independent graph nodes cannot collectively exceed the free-tier rate too quickly. This deliberately trades evaluation and chat throughput for fewer provider-side failures; injected offline clients are not delayed.
+
+The default interval is five seconds. Temporary `429`, `500`, `502`, `503`, `504`, and SDK `ServerError` failures use bounded exponential retries, with three total attempts and a five-second base delay by default. `GEMINI_MIN_INTERVAL_SECONDS`, `GEMINI_MAX_ATTEMPTS`, and `GEMINI_RETRY_BASE_SECONDS` override these values; an interval of zero disables pacing. Permanent client, authentication, model, validation and policy failures are not blindly retried. Throttling reduces free-tier rate pressure but cannot guarantee availability when Google is overloaded or a daily quota is exhausted.
+
+Each actual SDK attempt emits `llm.started` and one `llm.finished`/`llm.failed`, with a unique call ID parented to its graph node. Rate-limit waits emit `llm.waiting`, and a recoverable provider failure emits `llm.retrying`; the CLI and TUI display both instead of appearing frozen. Events retain purpose, attempt number, requested model, provider, monotonic duration, response ID/model version when supplied, and usage. Provider error text, credentials, prompts and raw responses are not copied into LLM metadata events. Usage is captured before JSON/citation validation, so invalid structured output still counts. `llm_calls` counts SDK invocations including failed retry attempts; it does not claim to count HTTP retries hidden inside one SDK invocation or evaluation-judge calls.
 
 Provider usage preserves nullable `prompt_token_count`, `candidates_token_count`, `thoughts_token_count`, `cached_content_token_count`, `tool_use_prompt_token_count` and `total_token_count`. Values are reported, never estimated; cached tokens are not added to prompt tokens and the provider's total is not reconstructed from a formula. API errors or an absent usage response have `usage: null` at the call level. A missing field stays null; an explicitly reported zero stays zero.
 
@@ -442,6 +475,10 @@ Install `uv` and GNU Make 4.3 or newer, then configure `GOOGLE_API_KEY` in `.env
 ```bash
 make prepare
 ```
+
+The copied `.env.example` also contains the free-tier pacing defaults. They can
+be increased for stricter quotas or reduced for a paid project; keeping the
+defaults are recommended for the course evaluation run.
 
 On macOS, use `gmake` if GNU Make is installed under that name. Preparation uses
 uv-managed Python (including headers for native builds) and syncs the locked
@@ -473,8 +510,15 @@ individual picture crop.
 After preparation, start the CLI/TUI as described above, or run evaluation:
 
 ```bash
-uv run --group eval python -m evaluation.run --dataset all --ragas
+uv run --env-file .env python -m evaluation.run --dataset all
+uv run --group eval --env-file .env python -m evaluation.run --dataset all --ragas
 ```
+
+The first command runs deterministic evaluation and the real Agent with the
+application throttle. Run the second command only after that succeeds: it adds
+RAGAS judge calls through a separate client and may require additional provider
+quota. See `docs/eval_protocol.md` for isolated dataset commands and report
+interpretation.
 
 For individual processing commands and the unit tests:
 
@@ -491,3 +535,15 @@ uv run python -m unittest discover -s tests -v
 
 Add `--ocr` to the parser command when OCR is needed. The first run may download Docling model files.
 The first chunking and indexing run also downloads `BAAI/bge-base-en-v1.5`.
+
+## Final Submission Checklist
+
+- confirm that the two member names shown in `README.md` use the preferred spelling;
+- run the complete offline test suite;
+- run the deterministic Rulebook, Text-to-SQL, and combined benchmarks from a
+  committed working tree, then run RAGAS separately if quota permits;
+- manually inspect the two combined answers and the multi-turn acceptance cases;
+- retain one reviewed evaluation report, including failures and configuration,
+  as the final project result;
+- verify the setup and Quick Start with a fresh `GOOGLE_API_KEY`, then send the
+  repository link to the teacher.

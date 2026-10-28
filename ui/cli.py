@@ -26,7 +26,15 @@ def _progress(event):
         print(f"{payload['source']} status={payload['status']} count={payload['count']} "
               f"strategy={payload.get('strategy', '-')} truncated={payload.get('truncated', False)}", file=sys.stderr)
     elif kind == "llm.started":
-        print(f"… LLM {payload['purpose']} model={payload['model']}", file=sys.stderr, flush=True)
+        attempt = (f" attempt={payload['attempt']}/{payload['max_attempts']}"
+                   if payload.get("max_attempts", 1) > 1 else "")
+        print(f"… LLM {payload['purpose']} model={payload['model']}{attempt}", file=sys.stderr, flush=True)
+    elif kind == "llm.waiting":
+        print(f"… Gemini rate limit: waiting {payload['wait_seconds']:.1f}s before "
+              f"{payload['purpose']}", file=sys.stderr, flush=True)
+    elif kind == "llm.retrying":
+        print(f"↻ Gemini temporary {payload['error']['type']}; retrying {payload['purpose']} "
+              f"in {payload['retry_in_seconds']:.1f}s", file=sys.stderr, flush=True)
     elif kind in ("llm.finished", "llm.failed"):
         print(f"{'✓' if kind == 'llm.finished' else '✗'} LLM {payload['purpose']} "
               f"{payload['duration_ms']:.1f} ms {format_usage(summarize_usage([payload['usage']]))}", file=sys.stderr)

@@ -64,8 +64,11 @@ Examples:
   never write SELECT toughness FROM units or invent a faction condition.
 
 For rulebook/both, supply a complete English semantic_query and 3-8 nonempty English
-Core Rules keyword terms/phrases. Otherwise both fields must be null. Original user
-input is attached by the application; do not return an original_query field.
+Core Rules keyword terms/phrases. Preserve the full scope of the standalone question.
+For broad or enumerative questions asking for different ways, types or methods, do
+not narrow the semantic query or keywords to one example or specific mechanism.
+Otherwise both fields must be null. Original user input is attached by the
+application; do not return an original_query field.
 
 depends_on_sql is true only for both when SQL results are needed to determine the
 actual rulebook query. Provide a provisional rulebook question without inventing
