@@ -12,8 +12,10 @@ RAG-b1/
 │   ├── pdf/
 │   │   └── Core Rules.pdf
 │   ├── sql/
-│   │   └── wahadb.sqlite
+│   │   ├── wahadb.sqlite
+│   │   └── SQL_AGENT_DATA_DICTIONARY.md
 │   ├── processed/
+│       ├── Core Rules.corrections.json  # Versioned input; other files are generated
 │       ├── Core Rules.json
 │       ├── Core Rules.md
 │       ├── Core Rules.chunks.jsonl
@@ -45,6 +47,7 @@ RAG-b1/
 │   ├── journal.md
 │   └── project-guide.md
 ├── .env.example
+├── Makefile
 ├── .python-version
 ├── pyproject.toml
 ├── uv.lock
@@ -433,8 +436,50 @@ CLI/TUI also reduce run summaries into session totals, keyed by run ID; history 
 
 ## Build and Simple Verification
 
+Install `uv` and GNU Make 4.3 or newer, then configure `GOOGLE_API_KEY` in `.env`
+(copy `.env.example`) or in the environment. From the repository root:
+
 ```bash
-uv sync
+make prepare
+```
+
+On macOS, use `gmake` if GNU Make is installed under that name. Preparation uses
+uv-managed Python (including headers for native builds) and syncs the locked
+runtime and `eval` dependencies. A C++ compiler is needed when dependencies such
+as `scikit-network` build from source. Preparation checks the local key configuration,
+reads the data dictionary, queries SQLite in read-only mode, and builds the
+rulebook artifacts. It then validates the existing benchmark datasets and runs
+one local retrieval request, downloading the reranker on first use. It makes no
+Gemini requests and does not run evaluation or generate benchmark questions.
+The key's validity, model access, and quota are exercised by later model calls.
+
+The committed inputs are `data/pdf/Core Rules.pdf`, `data/sql/wahadb.sqlite`,
+`data/sql/SQL_AGENT_DATA_DICTIONARY.md`, the source-backed
+`data/processed/Core Rules.corrections.json`, and `evaluation/datasets/*_v1.jsonl`.
+Parsed JSON/Markdown, images, chunks, and indexes are local generated artifacts.
+
+`make parse`, `make chunk`, and `make index` also build any required earlier
+stages. `make check` builds the indexes if needed and runs the same readiness
+checks as `make prepare`. Every invocation syncs dependencies; this does not
+force unchanged data to rebuild. Make tracks the PDF, processing code,
+corrections, dependency files, and key output files. A correction change rebuilds
+chunks and indexes; an indexing-code change only rebuilds indexes. Changes to
+the parser, PDF, Makefile, or dependency files rebuild the full chain. Index
+rebuilds replace the Chroma collection and reuse cached embeddings for unchanged
+content. Failed recipes remove their modified targets so a later run can retry.
+Use `make -B parse` to force parsing, for example after manually deleting an
+individual picture crop.
+
+After preparation, start the CLI/TUI as described above, or run evaluation:
+
+```bash
+uv run --group eval python -m evaluation.run --dataset all --ragas
+```
+
+For individual processing commands and the unit tests:
+
+```bash
+uv sync --locked --group eval --managed-python
 uv run python -m ingestion.pdf_parser "data/pdf/Core Rules.pdf"
 uv run python -m ingestion.chunker "data/processed/Core Rules.json"
 uv run python -m ingestion.build_index "data/processed/Core Rules.chunks.jsonl" --recreate

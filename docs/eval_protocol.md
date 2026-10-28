@@ -2,6 +2,11 @@
 
 ## Quick start
 
+First configure `GOOGLE_API_KEY` in `.env` or the environment and run
+`make prepare` from the repository root. This installs runtime and evaluation
+dependencies, builds the rulebook indexes, and validates the existing frozen
+datasets. Dataset generation and evaluation are separate from preparation.
+
 Run all 20 cases with the real Agent, but without the additional RAGAS judge:
 
 ```bash
