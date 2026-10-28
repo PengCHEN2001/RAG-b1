@@ -3,7 +3,7 @@
 import argparse
 import json
 from pathlib import Path
-from threading import Event
+from threading import Event, RLock
 from time import perf_counter
 from uuid import uuid4
 
@@ -18,6 +18,7 @@ from textual.widgets import (
     TabbedContent, TabPane, TextArea,
 )
 from textual.worker import Worker, WorkerState
+from tqdm import tqdm
 
 from agent import EvidenceContext, build_agent_graph
 from agent.nodes import DEFAULT_MODEL
@@ -72,6 +73,10 @@ class RAGApp(App):
     def __init__(self, *, graph=None, context=None, trace_dir=DEFAULT_TRACE_DIR,
                  inspect_path=None, trace=None):
         super().__init__()
+        # Textual captures stderr with fileno=-1; tqdm's default process lock
+        # cannot start its resource tracker against that stream.
+        # ponytail: thread workers only; share a process lock if adding processes.
+        tqdm.set_lock(RLock())
         self.graph, self.context = graph, context
         self.trace_dir = trace_dir
         self.inspect_path, self.offline_trace = inspect_path, trace

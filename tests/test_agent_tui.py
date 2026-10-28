@@ -2,7 +2,10 @@
 
 import asyncio
 import json
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from threading import Event
@@ -20,6 +23,37 @@ from test_agent_response import response_output
 from test_sql_hybrid import client_for
 from test_llm_usage import usage_response
 from ui.tui import RAGApp, main
+
+
+class ProgressBarTests(unittest.TestCase):
+    def test_cold_progress_bars_work_across_threads_with_textual_stderr(self):
+        # A fresh interpreter prevents an earlier test from warming tqdm's lock.
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", textwrap.dedent("""
+                from concurrent.futures import ThreadPoolExecutor
+                from contextlib import redirect_stderr
+
+                from huggingface_hub.utils import tqdm as hub_tqdm
+                from tqdm import tqdm
+                from tqdm.auto import tqdm as auto_tqdm
+
+                from ui.tui import RAGApp
+
+                app = RAGApp(trace_dir=None)
+
+                def load(_):
+                    for progress in (tqdm, auto_tqdm, hub_tqdm):
+                        assert list(progress(range(2), desc="Loading weights")) == [0, 1]
+                    return "loaded"
+
+                with redirect_stderr(app._capture_stderr):
+                    for _ in range(2):
+                        with ThreadPoolExecutor(max_workers=2) as pool:
+                            assert list(pool.map(load, range(2))) == ["loaded", "loaded"]
+            """)],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class AgentTUITests(unittest.IsolatedAsyncioTestCase):
